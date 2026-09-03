@@ -1,0 +1,12 @@
+node_modules
+.DS_Store
+dist
+*.local
+.env*
+!.env.example
+.dev.vars
+.tanstack
+.wrangler
+.alchemy
+.output
+*.tsbuildinfo
