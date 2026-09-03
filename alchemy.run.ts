@@ -33,8 +33,17 @@ export class Website extends Cloudflare.Website.Vite<Website>()(
 
 export type WebsiteEnv = Cloudflare.InferEnv<typeof Website>
 
+const stackName = (project: string | undefined) => {
+  const slug = (project ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32)
+  return slug ? `sylph-${slug}` : "sylph-tanstack-template"
+}
+
 export default Alchemy.Stack(
-  "SylphTanStackTemplate",
+  stackName(process.env.SYLPH_PROJECT),
   {
     providers: Cloudflare.providers(),
     state: Cloudflare.state(),

@@ -36,7 +36,7 @@ Alchemy reads `.env` before the process environment.
 
 ## How Sylph deploys it
 
-Sylph runs the Check stages in a Cloudflare CI sandbox with `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `SYLPH_CHECKPOINT`, and `SYLPH_DEPLOYMENT` set. `scripts/sylph-deploy.ts` maps those onto an Alchemy stage:
+Sylph runs the Check stages in a Cloudflare CI sandbox with `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `SYLPH_PROJECT`, `SYLPH_CHECKPOINT`, and `SYLPH_DEPLOYMENT` set. The Alchemy stack is named `sylph-<SYLPH_PROJECT>` so every Project forked from this template gets its own Workers, database, and state. Without `SYLPH_PROJECT` the stack is `sylph-tanstack-template`. `scripts/sylph-deploy.ts` maps the deployment variables onto an Alchemy stage:
 
 | `SYLPH_DEPLOYMENT` | Stage | Printed |
 |---|---|---|

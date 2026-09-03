@@ -16,6 +16,7 @@ This is a Cloudflare Workers application built with TanStack Start, shadcn/ui, E
 Sylph verifies every Checkpoint with these package scripts, in this order: `typecheck`, `lint`, `test`, `build`, then `sylph:preview`. Production uses `build` then `sylph:deploy`. Keep all six scripts working.
 
 - `scripts/sylph-deploy.ts` deploys an Alchemy stage named from `SYLPH_DEPLOYMENT` and `SYLPH_CHECKPOINT` and prints `SYLPH_PREVIEW_URL=` or `SYLPH_PRODUCTION_URL=`.
+- `alchemy.run.ts` names the stack `sylph-<SYLPH_PROJECT>`. Sylph sets `SYLPH_PROJECT` to the Project slug so resources never collide with other Projects in the same Cloudflare account. Keep that derivation.
 - The home page renders `SYLPH_CHECKPOINT=<commit>` and `SYLPH_DEPLOYMENT=<kind>` so the Preview browser check can confirm it is looking at the right deployment. Keep that text on the root route.
 - `src/routeTree.gen.ts` is committed because `typecheck` runs before `build`. Regenerate it with `bun run build` after adding or renaming routes, then commit it.
 
