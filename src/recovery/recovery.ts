@@ -23,6 +23,7 @@ export interface RecoveryConfiguration {
   encryptionKey: string
   fetch?: (url: string, init: RequestInit) => Promise<Response>
   now?: () => number
+  drainTimeoutMs?: number
 }
 
 export interface CaptureInput {
@@ -170,7 +171,7 @@ const createRecovery = (
     const schema = Schema.decodeUnknownSync(RecoverySchemaRows)(
       await query(
         databaseId,
-        "SELECT name, type, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY type, name"
+        "SELECT name, type, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*' ORDER BY type, name"
       )
     )
     const tables = schema.filter((row) => row.type === "table")
@@ -420,7 +421,24 @@ const createRecovery = (
           "UPDATE sylph_recovery_gate SET owner = ? WHERE id = 1 AND (owner IS NULL OR owner = ?)",
           [releaseId, releaseId]
         )
-        await paused(releaseId)
+        const deadline =
+          Date.now() +
+          Math.min(30000, Math.max(0, configuration.drainTimeoutMs ?? 30000))
+        while (true) {
+          const state = Schema.decodeUnknownSync(RecoveryGate)(
+            (
+              await control(
+                "SELECT owner, active FROM sylph_recovery_gate WHERE id = 1"
+              )
+            )[0]
+          )
+          if (state.owner !== releaseId)
+            throw new Error("Another release owns the pause")
+          if (state.active === 0) return
+          if (Date.now() >= deadline)
+            throw new Error("Writers did not drain before the deadline")
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+        }
       }),
     resume: (releaseId) =>
       wrap("Resume writers", async () => {

@@ -1,6 +1,8 @@
 import * as Redacted from "effect/Redacted"
 import { sylphResources, sylphSecrets } from "./scripts/sylph-resources"
 import * as Alchemy from "alchemy"
+import { adopt } from "alchemy/AdoptPolicy"
+import { retain } from "alchemy/RemovalPolicy"
 import * as Cloudflare from "alchemy/Cloudflare"
 import * as Config from "effect/Config"
 import * as Effect from "effect/Effect"
@@ -13,12 +15,12 @@ const applicationSecrets = sylphSecrets(process.env.SYLPH_PROJECT_SECRETS)
 const Database = Cloudflare.D1.Database("Database", {
   migrations: "migrations",
   name: resources?.databaseName,
-})
+}).pipe(adopt(false), retain(process.env.SYLPH_DEPLOYMENT === "production"))
 
 const RecoveryControl = Cloudflare.D1.Database("RecoveryControl", {
   migrations: "recovery-migrations",
   name: resources?.controlDatabaseName,
-})
+}).pipe(adopt(false), retain())
 
 export class Website extends Cloudflare.Website.Vite<Website>()(
   "Website",
@@ -32,6 +34,10 @@ export class Website extends Cloudflare.Website.Vite<Website>()(
         ? { name: resources.hostname, zoneId: resources.zoneId }
         : undefined,
       main: "src/worker.ts",
+      observability: {
+        enabled: true,
+        logs: { enabled: true, invocationLogs: true },
+      },
       compatibility: {
         flags: ["nodejs_compat"],
       },
@@ -45,9 +51,12 @@ export class Website extends Cloudflare.Website.Vite<Website>()(
         BETTER_AUTH_SECRET: Config.redacted("BETTER_AUTH_SECRET"),
         DB: database,
         SYLPH_RECOVERY_CONTROL: recoveryControl,
-        SYLPH_RECOVERY_VERIFY_TOKEN: Config.redacted(
-          "SYLPH_RECOVERY_VERIFY_TOKEN"
-        ),
+        SYLPH_RECOVERY_VERIFY_TOKEN:
+          process.env.SYLPH_DEPLOYMENT === "production"
+            ? Config.redacted("SYLPH_RECOVERY_VERIFY_TOKEN")
+            : Config.redacted("SYLPH_RECOVERY_VERIFY_TOKEN").pipe(
+                Config.withDefault(Redacted.make(""))
+              ),
         SYLPH_RELEASE_ID: Config.string("SYLPH_RELEASE_ID").pipe(
           Config.withDefault("local")
         ),
@@ -85,7 +94,7 @@ export default Alchemy.Stack(
       yield* RecoveryControl
       return { url: "" }
     }
-    const website = yield* Website
+    const website = yield* Website.pipe(adopt(false))
 
     return {
       url: website.url.as<string>(),

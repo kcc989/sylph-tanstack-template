@@ -9,7 +9,11 @@ test("resource plan pins isolated Worker and D1 names", () => {
   expect(resources.plan).toEqual([
     { kind: "worker", name: `${resources.prefix}-web` },
     { kind: "d1", name: `${resources.prefix}-db` },
-    { kind: "d1", name: `${resources.prefix}-recovery` },
+    {
+      kind: "d1",
+      name: `${resources.prefix}-recovery`,
+      purpose: "recovery_control",
+    },
   ])
   expect(() => sylphResources({})).toThrow("ownership checks")
 })

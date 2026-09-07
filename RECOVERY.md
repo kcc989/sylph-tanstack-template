@@ -2,7 +2,7 @@
 
 This candidate implements resource planning and all five production release hooks. Sylph supplies the immutable Project, release, Checkpoint, baseline, resource reservation, and encrypted recovery inputs. Do not run production commands with local owner credentials.
 
-The plan declares a Worker, application D1 database, and separate recovery-control D1 database. The control database contains the writer gate, encrypted immutable secret versions, backup manifests, and restore evidence. Application restoration must never rewind it.
+The plan declares a Worker, application D1 database, and separate recovery-control D1 database. The control database contains the writer gate, encrypted immutable secret versions, backup manifests, and restore evidence. Application restoration must never rewind it. Its plan entry has `purpose: "recovery_control"`, and its Alchemy removal policy always retains the physical database, including in Preview stages. The production application database also has a retain policy. These policies leave physical data in place if a declaration is removed; Alchemy can still forget the state row. Sylph ownership claims and independently reviewed removal remain required.
 
 Every normal request enters the writer gate. Preparation pauses admission and requires active requests to drain before capture. A failed or uncertain operation retains the pause. An explicitly selected recovery can adopt a drained failed release pause. The authenticated read-only probe verifies the release ID, Checkpoint, application database read, and keyed secret fingerprints while paused. After resume, verification also checks the ordinary root route.
 
@@ -21,3 +21,7 @@ The adapter supports D1 and encrypted secret versions. It rejects unsupported st
 ## Publication
 
 This is an unpublished candidate until its immutable commit is pushed after approval and Sylph updates its pinned release. Existing Projects must receive these changes as a new reviewed Checkpoint. Do not overwrite accepted history or adopt existing Cloudflare resources without the Project ownership workflow.
+
+## Existing resources
+
+This starter generates fresh reserved names and does not opt resources into Alchemy adoption. It does not implement arbitrary legacy names or automatically rewrite an existing stack. A Project adoption review records Sylph ownership only; a separate reviewed source change must preserve the existing physical names and logical IDs and set per-resource Alchemy adoption policy for the resources explicitly approved. Generic application adoption cannot claim the recovery-control database. Never replace these policies with a blanket adoption flag.

@@ -14,10 +14,10 @@ export const sylphResources = (environment: NodeJS.ProcessEnv) => {
     throw new Error(
       "Custom domains require a production deployment and a Cloudflare zone ID"
     )
-  const plan: Array<{ kind: string; name: string }> = [
+  const plan: Array<{ kind: string; name: string; purpose?: string }> = [
     { kind: "worker", name: `${prefix}-web` },
     { kind: "d1", name: `${prefix}-db` },
-    { kind: "d1", name: `${prefix}-recovery` },
+    { kind: "d1", name: `${prefix}-recovery`, purpose: "recovery_control" },
   ]
   if (hostname) plan.push({ kind: "domain", name: hostname })
   return {
