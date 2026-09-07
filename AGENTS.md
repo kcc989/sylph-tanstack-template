@@ -30,4 +30,4 @@ Sylph verifies every Checkpoint with these package scripts, in this order: `type
 
 ## Working in Sylph
 
-Sylph runs installs, tests, builds, and deploys in Cloudflare CI, not in the workspace. After a coherent change, call `workspace_run_checks` and wait for the result. Use `workspace_preview` and `workspace_browser` to look at the deployed Preview.
+Use native file tools and shell commands in the Workspace sandbox. Run `bun install` to generate the lockfile after dependency changes, and run local tests as needed. After a coherent change, call `workspace_run_checks` once for an immutable Checkpoint and recorded Cloudflare CI verification, then end the Turn. Results arrive automatically. Use `workspace_preview` and `workspace_browser` to look at the deployed Preview.
