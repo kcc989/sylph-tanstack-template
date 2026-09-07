@@ -4,6 +4,7 @@ import {
   recoveryConfiguration,
   recoveryManifestId,
   requiredReleaseValue,
+  assertRecoveryManifest,
 } from "./sylph-recovery-config"
 import { sylphResources } from "./sylph-resources"
 import { spawn } from "node:child_process"
@@ -80,15 +81,16 @@ const main = async () => {
     const secrets = await Effect.runPromise(
       Effect.gen(function* () {
         const recovery = yield* CloudflareD1Recovery
-        const selected = process.env.SYLPH_RECOVERY_POINT
-          ? yield* recovery.secrets(
-              yield* recovery.readManifest(
-                recoveryManifestId().database.backupRef
-              )
-            )
-          : Schema.decodeUnknownSync(
-              Schema.Record(Schema.String, Schema.String)
-            )(JSON.parse(requiredReleaseValue("SYLPH_RECOVERY_SECRETS")))
+        let selected: Record<string, string>
+        if (process.env.SYLPH_RECOVERY_POINT) {
+          const { point, database } = recoveryManifestId()
+          const manifest = yield* recovery.readManifest(database.backupRef)
+          assertRecoveryManifest(point, manifest)
+          selected = yield* recovery.secrets(manifest)
+        } else
+          selected = Schema.decodeUnknownSync(
+            Schema.Record(Schema.String, Schema.String)
+          )(JSON.parse(requiredReleaseValue("SYLPH_RECOVERY_SECRETS")))
         yield* recovery.stageSecrets(
           requiredReleaseValue("SYLPH_RELEASE_ID"),
           selected

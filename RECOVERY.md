@@ -8,7 +8,9 @@ Every normal request enters the writer gate. Preparation pauses admission and re
 
 Secret values are staged as encrypted immutable versions before a Worker deploy. Later capture selects the version named by the authenticated live Worker and compares its keyed fingerprints with actual live values. Recovery deployment decrypts the selected version in process memory. It does not write plaintext secrets into repository files or CI snapshots.
 
-Automatic migration review preserves all existing migration files and accepts only new tables and indexes. Recovery validates its explicitly selected immutable target and restores its schema before publishing that code. Other migration forms require a reviewed extension of the contract.
+Automatic migration review preserves all existing migration files and accepts only new tables and nonunique indexes on existing data. Unique indexes require an empty initial baseline or a separate data compatibility check. Recovery validates its explicitly selected immutable target and restores its schema before publishing that code. Changes to recovery migrations, the worker gate, or deployment infrastructure require a tested extension of the recovery integration. The proposed resource plan must match the supported starter topology before mutation.
+
+The release verification hook uses only its scoped probe token. Its claim covers an authenticated service probe and a database read, then the ordinary homepage after writes resume. It does not prove a signed-in application user's data journey; the combined lifecycle suite must perform that separate login, mutation, reload, restore, and undo proof.
 
 ## First release and restore proof
 

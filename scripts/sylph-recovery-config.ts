@@ -1,6 +1,7 @@
 import { Schema } from "effect"
 import { CloudflareD1RecoveryLive } from "../src/recovery/recovery"
 import { sylphResources } from "./sylph-resources"
+import type { D1RecoveryManifest } from "../src/recovery/domain"
 
 export const requiredReleaseValue = (name: string) => {
   const value = process.env[name]
@@ -72,6 +73,8 @@ export const recoveryManifestId = () => {
   )
   if (
     !database ||
+    point.resources.filter((resource) => resource.kind === "database")
+      .length !== 1 ||
     point.resources.some(
       (resource) =>
         !["database", "secret"].includes(resource.kind) ||
@@ -82,4 +85,25 @@ export const recoveryManifestId = () => {
       "Recovery point contains an unsupported resource or manifest"
     )
   return { point, database }
+}
+
+export const assertRecoveryManifest = (
+  point: ReturnType<typeof recoveryManifestId>["point"],
+  manifest: D1RecoveryManifest
+) => {
+  const expected = [
+    `database:${manifest.databaseId}`,
+    ...manifest.secrets.map((secret) => `secret:${secret.name}`),
+  ].sort()
+  const actual = point.resources
+    .map((resource) => `${resource.kind}:${resource.id}`)
+    .sort()
+  if (
+    point.deploymentId !== manifest.releaseId ||
+    JSON.stringify(actual) !== JSON.stringify(expected) ||
+    point.resources.some((resource) => resource.backupRef !== manifest.id)
+  )
+    throw new Error(
+      "Recovery receipt does not match the captured database and exact secret versions"
+    )
 }

@@ -1,11 +1,13 @@
 import { spawnSync } from "node:child_process"
 import { Effect, Schema } from "effect"
 import { CloudflareD1Recovery } from "../src/recovery/recovery"
-import { reviewMigrations } from "./sylph-release-review"
+import { reviewMigrations, reviewRecoveryPlan } from "./sylph-release-review"
+import { sylphResources } from "./sylph-resources"
 import {
   recoveryConfiguration,
   recoveryManifestId,
   requiredReleaseValue as required,
+  assertRecoveryManifest,
 } from "./sylph-recovery-config"
 
 import { RecoveryProbe, secretFingerprints } from "../src/recovery/verification"
@@ -35,9 +37,14 @@ const emit = (marker: string, value: unknown) =>
 
 const main = async () => {
   if (action === "review") {
+    reviewRecoveryPlan(
+      required("SYLPH_RESOURCE_PLAN"),
+      sylphResources(process.env).plan
+    )
     let evidence = reviewMigrations(
       process.env.SYLPH_RECOVERY_POINT ? null : baseCommit,
-      commit
+      commit,
+      baseCommit
     )
     if (process.env.SYLPH_RECOVERY_POINT) {
       const target = Schema.decodeUnknownSync(
@@ -53,6 +60,41 @@ const main = async () => {
       evidence = `Selected recovery restores the matching data schema and secret versions before deployment. ${evidence}`
     }
     emit("SYLPH_MIGRATION_REVIEW", { ...identity, compatible: true, evidence })
+    return
+  }
+  if (action === "verify") {
+    const url = required("SYLPH_PRODUCTION_URL")
+    const result = await awaitProbe(url)
+    if (result.checkpoint !== commit || result.releaseId !== deploymentId)
+      throw new Error(
+        "Production probe returned a different Checkpoint or release"
+      )
+    if (result.pausedBy && result.pausedBy !== deploymentId)
+      throw new Error("A different release owns the writer pause")
+    if (!result.pausedBy) {
+      const response = await fetch(url, {
+        redirect: "error",
+        signal: AbortSignal.timeout(30_000),
+      })
+      const text = (await response.text()).replace(/<[^>]*>/g, "")
+      if (
+        !response.ok ||
+        !text.includes(`SYLPH_CHECKPOINT=${commit}`) ||
+        !text.includes("SYLPH_DEPLOYMENT=production")
+      )
+        throw new Error(
+          "Resumed application route failed deployment identity verification"
+        )
+    }
+    emit("SYLPH_PRODUCTION_JOURNEY", {
+      deploymentId,
+      commit,
+      url,
+      passed: true,
+      journeys: [
+        "Authenticated deployment identity and application database read",
+      ],
+    })
     return
   }
   required("CLOUDFLARE_ACCOUNT_ID")
@@ -164,6 +206,7 @@ const main = async () => {
         if (database.id !== databaseId)
           throw new Error("Recovery database identity mismatch")
         const manifest = yield* recovery.readManifest(database.backupRef)
+        assertRecoveryManifest(point, manifest)
         yield* recovery.restore(manifest, deploymentId)
         emit("SYLPH_DATA_RESTORED", {
           deploymentId,
@@ -173,44 +216,6 @@ const main = async () => {
           resources: point.resources.map(
             (resource) => `${resource.kind}:${resource.id}`
           ),
-        })
-        return
-      }
-      if (action === "verify") {
-        const url = required("SYLPH_PRODUCTION_URL")
-        const result = yield* Effect.tryPromise(() => awaitProbe(url))
-        if (result.checkpoint !== commit || result.releaseId !== deploymentId)
-          throw new Error(
-            "Production probe returned a different Checkpoint or release"
-          )
-        if (result.pausedBy && result.pausedBy !== deploymentId)
-          throw new Error("A different release owns the writer pause")
-        if (!result.pausedBy) {
-          const response = yield* Effect.tryPromise(() =>
-            fetch(url, {
-              redirect: "error",
-              signal: AbortSignal.timeout(30_000),
-            })
-          )
-          const html = yield* Effect.tryPromise(() => response.text())
-          const text = html.replace(/<[^>]*>/g, "")
-          if (
-            !response.ok ||
-            !text.includes(`SYLPH_CHECKPOINT=${commit}`) ||
-            !text.includes("SYLPH_DEPLOYMENT=production")
-          )
-            throw new Error(
-              "Resumed application route failed deployment identity verification"
-            )
-        }
-        emit("SYLPH_PRODUCTION_JOURNEY", {
-          deploymentId,
-          commit,
-          url,
-          passed: true,
-          journeys: [
-            "Authenticated deployment identity and application database read",
-          ],
         })
         return
       }
