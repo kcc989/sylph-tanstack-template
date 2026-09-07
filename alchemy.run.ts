@@ -1,25 +1,56 @@
+import * as Redacted from "effect/Redacted"
+import { sylphResources, sylphSecrets } from "./scripts/sylph-resources"
 import * as Alchemy from "alchemy"
 import * as Cloudflare from "alchemy/Cloudflare"
 import * as Config from "effect/Config"
 import * as Effect from "effect/Effect"
 
+const resources = process.env.SYLPH_RESOURCE_PREFIX
+  ? sylphResources(process.env)
+  : null
+const applicationSecrets = sylphSecrets(process.env.SYLPH_PROJECT_SECRETS)
+
 const Database = Cloudflare.D1.Database("Database", {
   migrations: "migrations",
+  name: resources?.databaseName,
+})
+
+const RecoveryControl = Cloudflare.D1.Database("RecoveryControl", {
+  migrations: "recovery-migrations",
+  name: resources?.controlDatabaseName,
 })
 
 export class Website extends Cloudflare.Website.Vite<Website>()(
   "Website",
   Effect.gen(function* () {
     const database = yield* Database
+    const recoveryControl = yield* RecoveryControl
 
     return {
+      name: resources?.workerName,
+      domain: resources?.hostname
+        ? { name: resources.hostname, zoneId: resources.zoneId }
+        : undefined,
       main: "src/worker.ts",
       compatibility: {
         flags: ["nodejs_compat"],
       },
       env: {
+        ...Object.fromEntries(
+          Object.entries(applicationSecrets).map(([name, value]) => [
+            name,
+            Redacted.make(value),
+          ])
+        ),
         BETTER_AUTH_SECRET: Config.redacted("BETTER_AUTH_SECRET"),
         DB: database,
+        SYLPH_RECOVERY_CONTROL: recoveryControl,
+        SYLPH_RECOVERY_VERIFY_TOKEN: Config.redacted(
+          "SYLPH_RECOVERY_VERIFY_TOKEN"
+        ),
+        SYLPH_RELEASE_ID: Config.string("SYLPH_RELEASE_ID").pipe(
+          Config.withDefault("local")
+        ),
         SYLPH_CHECKPOINT: Config.string("SYLPH_CHECKPOINT").pipe(
           Config.withDefault("")
         ),
@@ -43,12 +74,17 @@ const stackName = (project: string | undefined) => {
 }
 
 export default Alchemy.Stack(
-  stackName(process.env.SYLPH_PROJECT),
+  resources?.prefix ?? stackName(process.env.SYLPH_PROJECT),
   {
     providers: Cloudflare.providers(),
     state: Cloudflare.state(),
   },
   Effect.gen(function* () {
+    if (process.env.SYLPH_BOOTSTRAP_RECOVERY === "1") {
+      yield* Database
+      yield* RecoveryControl
+      return { url: "" }
+    }
     const website = yield* Website
 
     return {

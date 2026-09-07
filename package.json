@@ -1,6 +1,6 @@
 {
   "name": "sylph-tanstack-template",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "TanStack Start, shadcn/ui, Effect, Better Auth, and Alchemy on Cloudflare Workers",
   "license": "Apache-2.0",
   "type": "module",
@@ -27,7 +27,13 @@
     "destroy": "alchemy destroy",
     "sylph:preview": "bun scripts/sylph-deploy.ts deploy",
     "sylph:preview:destroy": "bun scripts/sylph-deploy.ts destroy",
-    "sylph:deploy": "bun scripts/sylph-deploy.ts deploy"
+    "sylph:deploy": "bun scripts/sylph-deploy.ts deploy",
+    "sylph:plan": "bun scripts/sylph-resources.ts",
+    "sylph:release:review": "bun scripts/sylph-release.ts review",
+    "sylph:release:prepare": "bun scripts/sylph-release.ts prepare",
+    "sylph:release:restore": "bun scripts/sylph-release.ts restore",
+    "sylph:release:verify": "bun scripts/sylph-release.ts verify",
+    "sylph:release:resume": "bun scripts/sylph-release.ts resume"
   },
   "dependencies": {
     "@base-ui/react": "1.7.0",

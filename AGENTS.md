@@ -13,10 +13,10 @@ This is a Cloudflare Workers application built with TanStack Start, shadcn/ui, E
 
 ## Check contract
 
-Sylph verifies every Checkpoint with these package scripts, in this order: `typecheck`, `lint`, `test`, `build`, then `sylph:preview`. Production uses `build` then `sylph:deploy`. Keep all six scripts working.
+Sylph verifies every Checkpoint with these package scripts, in this order: `typecheck`, `lint`, `test`, `build`, then `sylph:plan` and `sylph:preview`. Production uses build and planning, followed by migration review, recovery capture, deployment, verification, and writer resume. Keep every required script working. Production also requires `sylph:release:review`, `sylph:release:prepare`, `sylph:release:restore`, `sylph:release:verify`, and `sylph:release:resume`.
 
 - `scripts/sylph-deploy.ts` deploys an Alchemy stage named from `SYLPH_DEPLOYMENT` and `SYLPH_CHECKPOINT` and prints `SYLPH_PREVIEW_URL=` or `SYLPH_PRODUCTION_URL=`.
-- `alchemy.run.ts` names the stack `sylph-<SYLPH_PROJECT>`. Sylph sets `SYLPH_PROJECT` to the Project slug so resources never collide with other Projects in the same Cloudflare account. Keep that derivation.
+- `sylph:plan` declares resource names without Cloudflare credentials. `alchemy.run.ts` uses the reserved `SYLPH_RESOURCE_PREFIX` for the stack, Worker, and D1 database. Preview prefixes are unique to each Check attempt; production prefixes are stable per Project. Do not adopt existing resources or create resources outside the declared plan.
 - The home page renders `SYLPH_CHECKPOINT=<commit>` and `SYLPH_DEPLOYMENT=<kind>` so the Preview browser check can confirm it is looking at the right deployment. Keep that text on the root route.
 - `src/routeTree.gen.ts` is committed because `typecheck` runs before `build`. Regenerate it with `bun run build` after adding or renaming routes, then commit it.
 
@@ -31,3 +31,11 @@ Sylph verifies every Checkpoint with these package scripts, in this order: `type
 ## Working in Sylph
 
 Use native file tools and shell commands in the Workspace sandbox. Run `bun install` to generate the lockfile after dependency changes, and run local tests as needed. After a coherent change, call `workspace_run_checks` once for an immutable Checkpoint and recorded Cloudflare CI verification, then end the Turn. Results arrive automatically. Use `workspace_preview` and `workspace_browser` to look at the deployed Preview.
+
+## Release recovery
+
+The Worker wraps every application request with a durable writer gate in a separate recovery-control D1 database. Keep the control database outside application restore. All state must remain in the declared application D1 database. Scheduled handlers, queue consumers, external storage, and background writers require a separately verified adapter before use.
+
+Release hooks use the vendored provider integration in `src/recovery`. They read exact deployed secret versions from encrypted immutable snapshots, perform D1 Time Travel restoration, and verify data and schema fingerprints. Never replace these operations with printed receipts. `SYLPH_RECOVERY_KEY` stays in CI; it is never a Worker binding. The authenticated read-only probe checks deployment identity and live secret fingerprints while application writes are paused.
+
+A provider restore drill is required for the current schema before capture can succeed. First production prepare bootstraps the two reserved D1 databases through Alchemy before capture; it does not deploy a Worker. Publication, production deployment, and destructive restoration require explicit approval.
