@@ -75,7 +75,11 @@ function HomeScreen() {
           )}
         </CardFooter>
       </Card>
-      <footer className="grid gap-1 font-mono text-xs text-muted-foreground">
+      <footer
+        className="grid gap-1 font-mono text-xs text-muted-foreground"
+        data-sylph-checkpoint={deployment.checkpoint}
+        data-sylph-deployment={deployment.kind}
+      >
         <p>SYLPH_CHECKPOINT={deployment.checkpoint}</p>
         <p>SYLPH_DEPLOYMENT={deployment.kind}</p>
       </footer>
