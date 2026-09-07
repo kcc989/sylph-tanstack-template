@@ -37,10 +37,20 @@ test("unique indexes require an empty initial baseline", () => {
 })
 
 test("review rejects proposed state or writers outside the recovery boundary", () => {
-  const plan = sylphResources({
+  const resources = sylphResources({
     SYLPH_RESOURCE_PREFIX: `sylph-${"a".repeat(24)}`,
-  }).plan
-  expect(() => reviewRecoveryPlan(JSON.stringify(plan), plan)).not.toThrow()
+  })
+  const plan = resources.plan
+  expect(() =>
+    reviewRecoveryPlan(JSON.stringify(plan), resources)
+  ).not.toThrow()
+  const extended = {
+    ...resources,
+    plan: [...plan, { kind: "worker", name: "another" }],
+  }
+  expect(() =>
+    reviewRecoveryPlan(JSON.stringify(extended.plan), extended)
+  ).toThrow("tested recovery integration")
   for (const kind of [
     "worker",
     "r2",
@@ -52,7 +62,7 @@ test("review rejects proposed state or writers outside the recovery boundary", (
     expect(() =>
       reviewRecoveryPlan(
         JSON.stringify([...plan, { kind, name: "additional" }]),
-        plan
+        resources
       )
     ).toThrow("tested recovery integration")
   expect(() =>
@@ -69,7 +79,7 @@ test("review rejects proposed state or writers outside the recovery boundary", (
             : item
         )
       ),
-      plan
+      resources
     )
   ).toThrow("tested recovery integration")
 })

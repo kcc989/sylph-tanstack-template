@@ -1,10 +1,25 @@
 import { execFileSync } from "node:child_process"
 import { isDeepStrictEqual } from "node:util"
+import type { sylphResources } from "./sylph-resources"
 
 const git = (...args: string[]) =>
   execFileSync("git", args, { encoding: "utf8" }).trim()
 
-export const reviewRecoveryPlan = (serialized: string, expected: unknown) => {
+export const reviewRecoveryPlan = (
+  serialized: string,
+  resources: ReturnType<typeof sylphResources>
+) => {
+  const expected: Array<{ kind: string; name: string; purpose?: string }> = [
+    { kind: "worker", name: resources.workerName },
+    { kind: "d1", name: resources.databaseName },
+    {
+      kind: "d1",
+      name: resources.controlDatabaseName,
+      purpose: "recovery_control",
+    },
+  ]
+  if (resources.hostname)
+    expected.push({ kind: "domain", name: resources.hostname })
   if (!isDeepStrictEqual(JSON.parse(serialized), expected))
     throw new Error(
       "This recovery adapter requires the unchanged single Worker, application D1 and recovery-control D1 plan. Additional resources or bindings require a tested recovery integration."
@@ -49,6 +64,7 @@ export const reviewMigrations = (
       "recovery-migrations",
       "alchemy.run.ts",
       "scripts/sylph-deploy.ts",
+      "scripts/sylph-resources.ts",
       "scripts/sylph-recovery-config.ts",
       "src/worker.ts",
       "src/recovery",

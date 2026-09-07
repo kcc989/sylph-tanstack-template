@@ -39,7 +39,7 @@ const main = async () => {
   if (action === "review") {
     reviewRecoveryPlan(
       required("SYLPH_RESOURCE_PLAN"),
-      sylphResources(process.env).plan
+      sylphResources(process.env)
     )
     let evidence = reviewMigrations(
       process.env.SYLPH_RECOVERY_POINT ? null : baseCommit,
