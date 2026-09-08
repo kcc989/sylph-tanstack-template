@@ -12,12 +12,15 @@ import {
   RecoverySecretSnapshot,
   RecoverySchedulesResponse,
   RecoverySettingsResponse,
+  RecoveryTopology,
+  type RecoveryWorkerInventory,
   type RecoverySqlRow,
 } from "./domain"
 
 export interface RecoveryConfiguration {
   accountId: string
   apiToken: string
+  apiBaseUrl?: string
   controlDatabaseId: string
   projectId: string
   encryptionKey: string
@@ -63,9 +66,14 @@ export class CloudflareD1Recovery extends Context.Service<
     pause: (releaseId: string) => RecoveryResult<void>
     resume: (releaseId: string) => RecoveryResult<void>
     inventory: (input: RecoveryInventory) => RecoveryResult<void>
+    inventoryTopology: (input: RecoveryTopology) => RecoveryResult<void>
     captureForDrill: (input: CaptureInput) => RecoveryResult<D1RecoveryManifest>
     capture: (input: CaptureInput) => RecoveryResult<D1RecoveryManifest>
     readManifest: (id: string) => RecoveryResult<D1RecoveryManifest>
+    preflightRestore: (
+      manifest: D1RecoveryManifest,
+      releaseId: string
+    ) => RecoveryResult<void>
     restore: (
       manifest: D1RecoveryManifest,
       releaseId: string
@@ -97,7 +105,19 @@ const createRecovery = (
 ): CloudflareD1Recovery["Service"] => {
   const fetcher = configuration.fetch ?? globalThis.fetch
   const now = configuration.now ?? Date.now
-  const root = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(configuration.accountId)}`
+  const root =
+    configuration.apiBaseUrl ??
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(configuration.accountId)}`
+  const endpoint = new URL(root)
+  if (
+    endpoint.protocol !== "https:" ||
+    endpoint.username ||
+    endpoint.password ||
+    endpoint.search ||
+    endpoint.hash ||
+    root.endsWith("/")
+  )
+    throw new Error("Recovery API base must be a clean HTTPS account endpoint")
   const wrap = <A>(
     operation: string,
     run: () => Promise<A>
@@ -298,8 +318,8 @@ const createRecovery = (
     schemaFingerprint: string
   ): Promise<D1RestoreEvidence> => {
     const rows = await control(
-      "SELECT evidence FROM sylph_recovery_operation WHERE schema_fingerprint = ? AND phase = 'verified' ORDER BY rowid DESC LIMIT 1",
-      [schemaFingerprint]
+      "SELECT evidence FROM (SELECT evidence, json_extract(evidence, '$.verifiedAt') AS sequence FROM sylph_recovery_resource_operation WHERE resource_kind = 'd1' AND schema_fingerprint = ? AND phase = 'verified' UNION ALL SELECT evidence, json_extract(evidence, '$.verifiedAt') AS sequence FROM sylph_recovery_operation WHERE schema_fingerprint = ? AND phase = 'verified') ORDER BY sequence DESC LIMIT 1",
+      [schemaFingerprint, schemaFingerprint]
     )
     const evidence = Schema.decodeUnknownSync(D1RestoreEvidence)(
       JSON.parse(Schema.decodeUnknownSync(Schema.String)(rows[0]?.evidence))
@@ -360,6 +380,160 @@ const createRecovery = (
       ]
     )
     return readManifest(id)
+  }
+  const inventoryWorker = async (input: RecoveryWorkerInventory) => {
+    const response = Schema.decodeUnknownSync(RecoverySettingsResponse)(
+      await request(
+        `/workers/scripts/${encodeURIComponent(input.workerName)}/settings`
+      )
+    )
+    if (!response.success) throw new Error("Worker bindings unavailable")
+    const databases = response.result.bindings
+      .filter((binding) => binding.type === "d1")
+      .map((binding) => binding.id)
+      .sort()
+    if (
+      JSON.stringify(databases) !==
+      JSON.stringify(
+        [...input.databaseIds, configuration.controlDatabaseId].sort()
+      )
+    )
+      throw new Error("Database inventory mismatch")
+    const bucketBindings = response.result.bindings.filter(
+      (binding) => binding.type === "r2_bucket"
+    )
+    if (
+      bucketBindings.some(
+        (binding) => !binding.bucket_name || binding.jurisdiction
+      ) ||
+      JSON.stringify(
+        bucketBindings.map((binding) => binding.bucket_name).sort()
+      ) !== JSON.stringify([...(input.bucketNames ?? [])].sort())
+    )
+      throw new Error(
+        "R2 bucket inventory mismatch or unsupported jurisdiction"
+      )
+    const declaredSecrets = [...input.secretNames].sort()
+    const actualSecrets = response.result.bindings
+      .filter((binding) => binding.type === "secret_text")
+      .map((binding) => binding.name)
+      .sort()
+    if (JSON.stringify(declaredSecrets) !== JSON.stringify(actualSecrets))
+      throw new Error("Secret inventory mismatch")
+    const safeBindings = new Set([
+      "d1",
+      "r2_bucket",
+      "secret_text",
+      "plain_text",
+      "json",
+      "assets",
+      "service",
+      "ai",
+    ])
+    if (
+      response.result.bindings.some(
+        (binding) => !safeBindings.has(binding.type)
+      )
+    )
+      throw new Error("Unsupported stateful or external binding")
+    const serviceBindings = response.result.bindings.filter(
+      (binding) => binding.type === "service"
+    )
+    if (
+      serviceBindings.some(
+        (binding) =>
+          !binding.service || binding.environment || binding.entrypoint
+      )
+    )
+      throw new Error("Service binding must target the default owned Worker")
+    if (
+      JSON.stringify(
+        serviceBindings.map((binding) => binding.service).sort()
+      ) !== JSON.stringify([...input.serviceTargets].sort())
+    )
+      throw new Error("Service inventory mismatch")
+    const controlBindings = response.result.bindings.filter(
+      (binding) => binding.name === "SYLPH_RECOVERY_CONTROL"
+    )
+    if (
+      controlBindings.length !== 1 ||
+      controlBindings[0]?.type !== "d1" ||
+      controlBindings[0]?.id !== configuration.controlDatabaseId
+    )
+      throw new Error("Every Worker must share the exact recovery gate")
+    const schedules = await request(
+      `/workers/scripts/${encodeURIComponent(input.workerName)}/schedules`
+    )
+    const scheduleResponse = Schema.decodeUnknownSync(
+      RecoverySchedulesResponse
+    )(schedules)
+    if (
+      !scheduleResponse.success ||
+      scheduleResponse.result.schedules.length !== 0
+    )
+      throw new Error("Scheduled writers are unsupported")
+  }
+  const inventoryTopology = async (value: RecoveryTopology) => {
+    const topology = Schema.decodeUnknownSync(RecoveryTopology)(value)
+    const names = new Set(topology.workers.map((worker) => worker.workerName))
+    if (names.size !== topology.workers.length)
+      throw new Error("Worker inventory contains duplicates")
+    for (const worker of topology.workers) {
+      if (
+        new Set(worker.databaseIds).size !== worker.databaseIds.length ||
+        new Set(worker.secretNames).size !== worker.secretNames.length ||
+        new Set(worker.serviceTargets).size !== worker.serviceTargets.length ||
+        worker.databaseIds.includes(configuration.controlDatabaseId)
+      )
+        throw new Error("Application database inventory is invalid")
+      if (worker.serviceTargets.some((target) => !names.has(target)))
+        throw new Error("Service target is outside the guarded topology")
+      await inventoryWorker(worker)
+    }
+    const databases = new Set(
+      topology.workers.flatMap((worker) => worker.databaseIds)
+    )
+    if (databases.size < 1 || databases.size > 20)
+      throw new Error("Recovery requires one to twenty application databases")
+  }
+  const preflightRestore = async (
+    input: D1RecoveryManifest,
+    releaseId: string
+  ) => {
+    const manifest = await readManifest(input.id)
+    if (JSON.stringify(manifest) !== JSON.stringify(input))
+      throw new Error("Saved manifest differs from request")
+    await paused(releaseId)
+    if (manifest.expiresAt <= now() || manifest.capturedAt > now())
+      throw new Error("Recovery point expired")
+    await secrets(manifest)
+    const undo = await control(
+      "SELECT id FROM sylph_recovery_manifest WHERE project_id = ? AND release_id = ? AND database_id = ? ORDER BY rowid DESC LIMIT 1",
+      [configuration.projectId, releaseId, manifest.databaseId]
+    )
+    const undoPoint = await readManifest(
+      Schema.decodeUnknownSync(Schema.String)(undo[0]?.id)
+    )
+    if (
+      undoPoint.expiresAt <= now() ||
+      undoPoint.capturedAt < now() - 15 * 60000
+    )
+      throw new Error("Fresh undo point required before restore")
+    const prior = await control(
+      "SELECT phase, evidence, manifest_id FROM sylph_recovery_operation WHERE release_id = ? UNION ALL SELECT phase, evidence, manifest_id FROM sylph_recovery_resource_operation WHERE release_id = ? AND resource_kind = 'd1' AND resource_id = ?",
+      [releaseId, releaseId, manifest.databaseId]
+    )
+    if (prior.length !== 0)
+      throw new Error("Restore already attempted; reconcile before retrying")
+    await secrets(undoPoint)
+    const current = await fingerprint(manifest.databaseId)
+    if (
+      current.fingerprint !== undoPoint.fingerprint ||
+      current.schemaFingerprint !== undoPoint.schemaFingerprint
+    )
+      throw new Error("Fresh undo point must match current data")
+    await bookmark(manifest.databaseId)
+    return manifest
   }
   return CloudflareD1Recovery.of({
     gate: () =>
@@ -448,8 +622,8 @@ const createRecovery = (
         const state = Schema.decodeUnknownSync(RecoveryGate)(rows[0])
         if (state.owner === null) return
         const operations = await control(
-          "SELECT phase FROM sylph_recovery_operation WHERE release_id = ?",
-          [releaseId]
+          "SELECT phase FROM sylph_recovery_operation WHERE release_id = ? UNION ALL SELECT phase FROM sylph_recovery_resource_operation WHERE release_id = ? UNION ALL SELECT phase FROM sylph_recovery_group_operation WHERE release_id = ?",
+          [releaseId, releaseId, releaseId]
         )
         if (operations.some((operation) => operation.phase !== "verified"))
           throw new Error(
@@ -470,56 +644,22 @@ const createRecovery = (
         if (after.owner !== null) throw new Error("Resume did not complete")
       }),
     inventory: (input) =>
-      wrap("Validate storage inventory", async () => {
-        const response = Schema.decodeUnknownSync(RecoverySettingsResponse)(
-          await request(
-            `/workers/scripts/${encodeURIComponent(input.workerName)}/settings`
-          )
-        )
-        if (!response.success) throw new Error("Worker bindings unavailable")
-        const databases = response.result.bindings
-          .filter((binding) => binding.type === "d1")
-          .map((binding) => binding.id)
-          .sort()
-        if (
-          JSON.stringify(databases) !==
-          JSON.stringify(
-            [input.databaseId, configuration.controlDatabaseId].sort()
-          )
-        )
-          throw new Error("Database inventory mismatch")
-        const declaredSecrets = [...input.secretNames].sort()
-        const actualSecrets = response.result.bindings
-          .filter((binding) => binding.type === "secret_text")
-          .map((binding) => binding.name)
-          .sort()
-        if (JSON.stringify(declaredSecrets) !== JSON.stringify(actualSecrets))
-          throw new Error("Secret inventory mismatch")
-        const safeBindings = new Set([
-          "d1",
-          "secret_text",
-          "plain_text",
-          "json",
-          "assets",
-        ])
-        if (
-          response.result.bindings.some(
-            (binding) => !safeBindings.has(binding.type)
-          )
-        )
-          throw new Error("Unsupported stateful or external binding")
-        const schedules = await request(
-          `/workers/scripts/${encodeURIComponent(input.workerName)}/schedules`
-        )
-        const scheduleResponse = Schema.decodeUnknownSync(
-          RecoverySchedulesResponse
-        )(schedules)
-        if (
-          !scheduleResponse.success ||
-          scheduleResponse.result.schedules.length !== 0
-        )
-          throw new Error("Scheduled writers are unsupported")
-      }),
+      wrap("Validate storage inventory", () =>
+        inventoryTopology({
+          workers: [
+            {
+              workerName: input.workerName,
+              databaseIds: [input.databaseId],
+              secretNames: [...input.secretNames],
+              serviceTargets: [],
+            },
+          ],
+        })
+      ),
+    inventoryTopology: (input) =>
+      wrap("Validate coordinated storage inventory", () =>
+        inventoryTopology(input)
+      ),
     capture: (input) =>
       wrap("Capture D1 recovery point", () => capture(input, true)),
     captureForDrill: (input) =>
@@ -532,39 +672,21 @@ const createRecovery = (
       ),
     fingerprint: (databaseId) =>
       wrap("Fingerprint D1", () => fingerprint(databaseId)),
+    preflightRestore: (input, releaseId) =>
+      wrap("Preflight D1 recovery point", async () => {
+        await preflightRestore(input, releaseId)
+      }),
     restore: (input, releaseId) =>
       wrap("Restore D1 recovery point", async () => {
-        const manifest = await readManifest(input.id)
-        if (JSON.stringify(manifest) !== JSON.stringify(input))
-          throw new Error("Saved manifest differs from request")
-        await paused(releaseId)
-        if (manifest.expiresAt <= now() || manifest.capturedAt > now())
-          throw new Error("Recovery point expired")
-        await secrets(manifest)
-        const undo = await control(
-          "SELECT id FROM sylph_recovery_manifest WHERE project_id = ? AND release_id = ? AND database_id = ? ORDER BY rowid DESC LIMIT 1",
-          [configuration.projectId, releaseId, manifest.databaseId]
-        )
-        const undoPoint = await readManifest(
-          Schema.decodeUnknownSync(Schema.String)(undo[0]?.id)
-        )
-        if (
-          undoPoint.expiresAt <= now() ||
-          undoPoint.capturedAt < now() - 15 * 60000
-        )
-          throw new Error("Fresh undo point required before restore")
-        const prior = await control(
-          "SELECT phase, evidence, manifest_id FROM sylph_recovery_operation WHERE release_id = ?",
-          [releaseId]
-        )
-        if (prior.length !== 0)
-          throw new Error(
-            "Restore already attempted; reconcile before retrying"
-          )
-        await bookmark(manifest.databaseId)
+        const manifest = await preflightRestore(input, releaseId)
         await control(
-          "INSERT INTO sylph_recovery_operation (release_id, manifest_id, schema_fingerprint, phase) VALUES (?, ?, ?, 'restoring')",
-          [releaseId, manifest.id, manifest.schemaFingerprint]
+          "INSERT INTO sylph_recovery_resource_operation (release_id, resource_kind, resource_id, manifest_id, schema_fingerprint, phase) VALUES (?, 'd1', ?, ?, ?, 'restoring')",
+          [
+            releaseId,
+            manifest.databaseId,
+            manifest.id,
+            manifest.schemaFingerprint,
+          ]
         )
         try {
           const restored = Schema.decodeUnknownSync(RecoveryRestoreResponse)(
@@ -591,14 +713,14 @@ const createRecovery = (
             verifiedAt: now(),
           })
           await control(
-            "UPDATE sylph_recovery_operation SET phase = 'verified', evidence = ? WHERE release_id = ? AND phase = 'restoring'",
-            [JSON.stringify(evidence), releaseId]
+            "UPDATE sylph_recovery_resource_operation SET phase = 'verified', evidence = ? WHERE release_id = ? AND resource_kind = 'd1' AND resource_id = ? AND phase = 'restoring'",
+            [JSON.stringify(evidence), releaseId, manifest.databaseId]
           )
           return evidence
         } catch (error) {
           await control(
-            "UPDATE sylph_recovery_operation SET phase = 'uncertain' WHERE release_id = ? AND phase = 'restoring'",
-            [releaseId]
+            "UPDATE sylph_recovery_resource_operation SET phase = 'uncertain' WHERE release_id = ? AND resource_kind = 'd1' AND resource_id = ? AND phase = 'restoring'",
+            [releaseId, manifest.databaseId]
           )
           throw error
         }

@@ -1,6 +1,6 @@
 {
   "name": "sylph-tanstack-template",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TanStack Start, shadcn/ui, Effect, Better Auth, and Alchemy on Cloudflare Workers",
   "license": "Apache-2.0",
   "type": "module",

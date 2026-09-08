@@ -1,13 +1,16 @@
 import { spawnSync } from "node:child_process"
 import { Effect, Schema } from "effect"
+import { CloudflareRecoveryGroup } from "../src/recovery/group"
+import { verifyR2RecoveryDrill } from "../src/recovery/r2-drill"
+import { verifyRecoveryDrill } from "../src/recovery/drill"
 import { CloudflareD1Recovery } from "../src/recovery/recovery"
 import { reviewMigrations, reviewRecoveryPlan } from "./sylph-release-review"
 import { sylphResources } from "./sylph-resources"
 import {
   recoveryConfiguration,
-  recoveryManifestId,
   requiredReleaseValue as required,
-  assertRecoveryManifest,
+  recoveryGroupId,
+  assertRecoveryGroup,
 } from "./sylph-recovery-config"
 
 import { RecoveryProbe, secretFingerprints } from "../src/recovery/verification"
@@ -102,6 +105,37 @@ const main = async () => {
   if (action === "prepare" || action === "restore")
     required("SYLPH_RECOVERY_KEY")
   if (action === "prepare" && !baseCommit) {
+    const provider = new URL(
+      process.env.SYLPH_CLOUDFLARE_API_BASE_URL ??
+        "https://api.cloudflare.com/client/v4"
+    )
+    if (
+      provider.protocol !== "https:" ||
+      provider.username ||
+      provider.password ||
+      provider.search ||
+      provider.hash
+    )
+      throw new Error(
+        "Initial release requires a clean HTTPS provider endpoint"
+      )
+    const root = `${provider.href.replace(/\/$/, "")}/accounts/${encodeURIComponent(required("CLOUDFLARE_ACCOUNT_ID"))}`
+    for (const worker of sylphResources(process.env).recoveryWorkers) {
+      const response = await fetch(
+        `${root}/workers/scripts/${encodeURIComponent(worker.workerName)}/settings`,
+        {
+          headers: {
+            Authorization: `Bearer ${required("CLOUDFLARE_API_TOKEN")}`,
+          },
+          redirect: "error",
+          signal: AbortSignal.timeout(30_000),
+        }
+      )
+      if (response.status !== 404)
+        throw new Error(
+          "Initial recovery bootstrap requires every declared Worker to be absent"
+        )
+    }
     const bootstrap = spawnSync(
       "bun",
       ["x", "alchemy", "deploy", "--stage", "production"],
@@ -114,9 +148,15 @@ const main = async () => {
     if (bootstrap.status !== 0)
       throw new Error("Initial recovery infrastructure provisioning failed")
   }
-  const { databaseId, resources, layer } = await recoveryConfiguration(
-    action === "prepare" || action === "restore"
-  )
+  const {
+    databaseId,
+    drillDatabaseId,
+    resources,
+    configuration,
+    r2Configuration,
+    groupLayer,
+    layer,
+  } = await recoveryConfiguration(action === "prepare" || action === "restore")
   await Effect.runPromise(
     Effect.gen(function* () {
       const recovery = yield* CloudflareD1Recovery
@@ -130,6 +170,18 @@ const main = async () => {
           liveReleaseId = live.releaseId
         }
         if (!baseCommit) {
+          yield* verifyRecoveryDrill(configuration, {
+            databaseId: drillDatabaseId,
+            applicationDatabaseId: databaseId,
+            expectedName: resources.drillDatabaseName,
+            releaseId: `drill-${deploymentId}`,
+          })
+          if (resources.drillBucketName)
+            yield* verifyR2RecoveryDrill(r2Configuration, {
+              bucketName: resources.drillBucketName,
+              applicationBucketNames: resources.bucketNames,
+              releaseId: `r2-drill-${deploymentId}`,
+            })
           const initialFingerprint = yield* recovery.fingerprint(databaseId)
           yield* recovery.restoreProof(initialFingerprint.schemaFingerprint)
           const initialSecrets = Schema.decodeUnknownSync(
@@ -153,14 +205,6 @@ const main = async () => {
         })
         const secrets = yield* recovery.secrets(manifest)
         if (baseCommit) {
-          yield* recovery.inventory({
-            workerName: resources.workerName,
-            databaseId,
-            secretNames: [
-              ...Object.keys(secrets),
-              "SYLPH_RECOVERY_VERIFY_TOKEN",
-            ],
-          })
           const live = yield* Effect.tryPromise(() =>
             awaitProbe(required("SYLPH_BASE_URL"), Object.keys(secrets))
           )
@@ -174,23 +218,40 @@ const main = async () => {
               "Live secrets differ from the immutable deployed snapshot"
             )
         }
+        const group = yield* Effect.gen(function* () {
+          const groups = yield* CloudflareRecoveryGroup
+          return yield* (baseCommit ? groups.capture : groups.captureInitial)({
+            releaseId: deploymentId,
+            liveReleaseId,
+          })
+        }).pipe(
+          Effect.provide(
+            groupLayer([...Object.keys(secrets), "SYLPH_RECOVERY_VERIFY_TOKEN"])
+          )
+        )
         emit("SYLPH_RECOVERY_POINT", {
           ...identity,
-          capturedAt: manifest.capturedAt,
-          expiresAt: manifest.expiresAt,
+          capturedAt: group.capturedAt,
+          expiresAt: group.expiresAt,
           writesPaused: true,
           inventoryComplete: true,
           resources: [
-            {
+            ...group.databases.map((database) => ({
               kind: "database",
-              id: databaseId,
-              backupRef: manifest.id,
-              restoreVerifiedAt: manifest.restoreVerifiedAt,
-            },
+              id: database.databaseId,
+              backupRef: `group:${group.id}`,
+              restoreVerifiedAt: database.restoreVerifiedAt,
+            })),
+            ...(group.buckets ?? []).map((bucket) => ({
+              kind: "object-storage",
+              id: bucket.bucketName,
+              backupRef: `group:${group.id}`,
+              restoreVerifiedAt: bucket.restoreVerifiedAt,
+            })),
             ...manifest.secrets.map((secret) => ({
               kind: "secret",
               id: secret.name,
-              backupRef: manifest.id,
+              backupRef: `group:${group.id}`,
               restoreVerifiedAt: manifest.restoreVerifiedAt,
             })),
           ],
@@ -202,12 +263,13 @@ const main = async () => {
         return
       }
       if (action === "restore") {
-        const { point, database } = recoveryManifestId()
-        if (database.id !== databaseId)
-          throw new Error("Recovery database identity mismatch")
-        const manifest = yield* recovery.readManifest(database.backupRef)
-        assertRecoveryManifest(point, manifest)
-        yield* recovery.restore(manifest, deploymentId)
+        const { point, id } = recoveryGroupId()
+        yield* Effect.gen(function* () {
+          const groups = yield* CloudflareRecoveryGroup
+          const group = yield* groups.read(id)
+          assertRecoveryGroup(point, group)
+          yield* groups.restore(id, deploymentId)
+        }).pipe(Effect.provide(groupLayer([])))
         emit("SYLPH_DATA_RESTORED", {
           deploymentId,
           recoveryDeploymentId: point.deploymentId,

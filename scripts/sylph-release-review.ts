@@ -1,3 +1,4 @@
+import { Schema } from "effect"
 import { execFileSync } from "node:child_process"
 import { isDeepStrictEqual } from "node:util"
 import type { sylphResources } from "./sylph-resources"
@@ -5,24 +6,119 @@ import type { sylphResources } from "./sylph-resources"
 const git = (...args: string[]) =>
   execFileSync("git", args, { encoding: "utf8" }).trim()
 
+const RecoveryServiceBinding = Schema.Struct({
+  type: Schema.Literals(["service", "r2_bucket"]),
+  name: Schema.String.check(Schema.isPattern(/^[A-Z][A-Z0-9_]{0,127}$/)),
+  target: Schema.NonEmptyString,
+})
+const RecoveryPlanResource = Schema.Struct({
+  kind: Schema.NonEmptyString,
+  name: Schema.NonEmptyString,
+  purpose: Schema.optional(Schema.String),
+  bindings: Schema.optional(Schema.Array(RecoveryServiceBinding)),
+})
+type RecoveryPlanResources = Omit<
+  ReturnType<typeof sylphResources>,
+  "recoveryWorkers"
+> & {
+  recoveryWorkers: readonly {
+    workerName: string
+    databaseNames: readonly string[]
+    serviceTargets: readonly string[]
+    bucketNames?: readonly string[]
+  }[]
+}
+
 export const reviewRecoveryPlan = (
   serialized: string,
-  resources: ReturnType<typeof sylphResources>
+  resources: RecoveryPlanResources
 ) => {
-  const expected: Array<{ kind: string; name: string; purpose?: string }> = [
-    { kind: "worker", name: resources.workerName },
-    { kind: "d1", name: resources.databaseName },
+  const parsed = JSON.parse(serialized)
+  const proposed = Schema.decodeUnknownSync(Schema.Array(RecoveryPlanResource))(
+    parsed
+  )
+  const workerNames = new Set(
+    resources.recoveryWorkers.map((worker) => worker.workerName)
+  )
+  if (workerNames.size !== resources.recoveryWorkers.length)
+    throw new Error("Guarded Worker names must be unique")
+  const guardedBuckets = [
+    ...new Set(
+      resources.recoveryWorkers.flatMap((worker) => worker.bucketNames ?? [])
+    ),
+  ].sort()
+  if (!isDeepStrictEqual(guardedBuckets, [...resources.bucketNames].sort()))
+    throw new Error(
+      "Every application bucket requires a declared guarded Worker binding"
+    )
+  const expected: Array<typeof RecoveryPlanResource.Type> = [
+    ...resources.recoveryWorkers.map((worker) => {
+      const bindings =
+        proposed.find(
+          (resource) =>
+            resource.kind === "worker" && resource.name === worker.workerName
+        )?.bindings ?? []
+      const serviceBindings = bindings.filter(
+        (binding) => binding.type === "service"
+      )
+      const bucketBindings = bindings.filter(
+        (binding) => binding.type === "r2_bucket"
+      )
+      const expectedBuckets = Object.entries(resources.bucketBindings)
+        .filter(([, target]) => worker.bucketNames?.includes(target))
+        .map(([name, target]) => ({ type: "r2_bucket", name, target }))
+      if (
+        !isDeepStrictEqual(bucketBindings, expectedBuckets) ||
+        !isDeepStrictEqual(
+          [...new Set(worker.bucketNames ?? [])].sort(),
+          expectedBuckets.map((binding) => binding.target).sort()
+        ) ||
+        worker.serviceTargets.some((target) => !workerNames.has(target)) ||
+        new Set(worker.serviceTargets).size !== worker.serviceTargets.length ||
+        new Set(bindings.map((binding) => binding.name)).size !==
+          bindings.length ||
+        !isDeepStrictEqual(
+          serviceBindings.map((binding) => binding.target).sort(),
+          [...worker.serviceTargets].sort()
+        )
+      )
+        throw new Error(
+          "Service bindings must match the exact declared guarded Worker targets; a tested recovery integration is required for other bindings"
+        )
+      return {
+        kind: "worker",
+        name: worker.workerName,
+        ...(bindings.length ? { bindings } : {}),
+      }
+    }),
+    ...[
+      ...new Set(
+        resources.recoveryWorkers.flatMap((worker) => worker.databaseNames)
+      ),
+    ].map((name) => ({ kind: "d1", name })),
     {
       kind: "d1",
       name: resources.controlDatabaseName,
       purpose: "recovery_control",
     },
+    {
+      kind: "d1",
+      name: resources.drillDatabaseName,
+      purpose: "recovery_control",
+    },
   ]
+  expected.push(...resources.bucketNames.map((name) => ({ kind: "r2", name })))
+  if (resources.drillBucketName)
+    expected.push({
+      kind: "r2",
+      name: resources.drillBucketName,
+      purpose: "recovery_control",
+    })
   if (resources.hostname)
     expected.push({ kind: "domain", name: resources.hostname })
-  if (!isDeepStrictEqual(JSON.parse(serialized), expected))
+  if (!isDeepStrictEqual(parsed, expected))
     throw new Error(
-      "This recovery adapter requires the unchanged single Worker, application D1 and recovery-control D1 plan. Additional resources or bindings require a tested recovery integration."
+      "This recovery adapter requires the declared guarded Worker, application D1, recovery-control and isolated drill plan. Additional resources or bindings require a tested recovery integration."
     )
 }
 

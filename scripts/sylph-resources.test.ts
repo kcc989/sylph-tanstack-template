@@ -14,6 +14,11 @@ test("resource plan pins isolated Worker and D1 names", () => {
       name: `${resources.prefix}-recovery`,
       purpose: "recovery_control",
     },
+    {
+      kind: "d1",
+      name: `${resources.prefix}-recovery-drill`,
+      purpose: "recovery_control",
+    },
   ])
   expect(() => sylphResources({})).toThrow("ownership checks")
 })

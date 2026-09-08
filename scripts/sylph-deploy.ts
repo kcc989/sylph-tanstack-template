@@ -1,10 +1,11 @@
 import { Effect, Schema } from "effect"
+import { CloudflareRecoveryGroup } from "../src/recovery/group"
 import { CloudflareD1Recovery } from "../src/recovery/recovery"
 import {
   recoveryConfiguration,
-  recoveryManifestId,
+  recoveryGroupId,
   requiredReleaseValue,
-  assertRecoveryManifest,
+  assertRecoveryGroup,
 } from "./sylph-recovery-config"
 import { sylphResources } from "./sylph-resources"
 import { spawn } from "node:child_process"
@@ -77,16 +78,29 @@ const main = async () => {
   }
 
   if (action === "deploy" && plan.deployment === "production") {
-    const { layer } = await recoveryConfiguration()
+    const { layer, groupLayer } = await recoveryConfiguration()
     const secrets = await Effect.runPromise(
       Effect.gen(function* () {
         const recovery = yield* CloudflareD1Recovery
         let selected: Record<string, string>
         if (process.env.SYLPH_RECOVERY_POINT) {
-          const { point, database } = recoveryManifestId()
-          const manifest = yield* recovery.readManifest(database.backupRef)
-          assertRecoveryManifest(point, manifest)
-          selected = yield* recovery.secrets(manifest)
+          const { point, id } = recoveryGroupId()
+          selected = yield* Effect.gen(function* () {
+            const groups = yield* CloudflareRecoveryGroup
+            const group = yield* groups.read(id)
+            assertRecoveryGroup(point, group)
+            const first = group.databases[0]
+            if (!first) throw new Error("Recovery group has no database")
+            const values = yield* recovery.secrets(first)
+            for (const database of group.databases) {
+              if (
+                JSON.stringify(yield* recovery.secrets(database)) !==
+                JSON.stringify(values)
+              )
+                throw new Error("Recovery group secret snapshots differ")
+            }
+            return values
+          }).pipe(Effect.provide(groupLayer([])))
         } else
           selected = Schema.decodeUnknownSync(
             Schema.Record(Schema.String, Schema.String)

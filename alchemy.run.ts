@@ -1,5 +1,10 @@
+import { sylphState } from "./scripts/sylph-broker"
 import * as Redacted from "effect/Redacted"
-import { sylphResources, sylphSecrets } from "./scripts/sylph-resources"
+import {
+  applicationBucketBindings,
+  sylphResources,
+  sylphSecrets,
+} from "./scripts/sylph-resources"
 import * as Alchemy from "alchemy"
 import { adopt } from "alchemy/AdoptPolicy"
 import { retain } from "alchemy/RemovalPolicy"
@@ -22,11 +27,35 @@ const RecoveryControl = Cloudflare.D1.Database("RecoveryControl", {
   name: resources?.controlDatabaseName,
 }).pipe(adopt(false), retain())
 
+const RecoveryDrill = Cloudflare.D1.Database("RecoveryDrill", {
+  migrations: "migrations",
+  name: resources?.drillDatabaseName,
+}).pipe(adopt(false), retain())
+
+const ApplicationBuckets = Object.fromEntries(
+  Object.keys(applicationBucketBindings).map((binding) => [
+    binding,
+    Cloudflare.R2.Bucket(`ApplicationBucket-${binding}`, {
+      name: resources?.bucketBindings[binding],
+    }).pipe(
+      adopt(false),
+      retain(process.env.SYLPH_DEPLOYMENT === "production")
+    ),
+  ])
+)
+
+const RecoveryBucketDrill = Object.keys(applicationBucketBindings).length
+  ? Cloudflare.R2.Bucket("RecoveryBucketDrill", {
+      name: resources?.drillBucketName,
+    }).pipe(adopt(false), retain())
+  : undefined
+
 export class Website extends Cloudflare.Website.Vite<Website>()(
   "Website",
   Effect.gen(function* () {
     const database = yield* Database
     const recoveryControl = yield* RecoveryControl
+    const buckets = yield* Effect.all(ApplicationBuckets)
 
     return {
       name: resources?.workerName,
@@ -48,6 +77,7 @@ export class Website extends Cloudflare.Website.Vite<Website>()(
             Redacted.make(value),
           ])
         ),
+        ...buckets,
         BETTER_AUTH_SECRET: Config.redacted("BETTER_AUTH_SECRET"),
         DB: database,
         SYLPH_RECOVERY_CONTROL: recoveryControl,
@@ -86,12 +116,15 @@ export default Alchemy.Stack(
   resources?.prefix ?? stackName(process.env.SYLPH_PROJECT),
   {
     providers: Cloudflare.providers(),
-    state: Cloudflare.state(),
+    state: sylphState(),
   },
   Effect.gen(function* () {
+    yield* RecoveryDrill
+    if (RecoveryBucketDrill) yield* RecoveryBucketDrill
     if (process.env.SYLPH_BOOTSTRAP_RECOVERY === "1") {
       yield* Database
       yield* RecoveryControl
+      yield* Effect.all(ApplicationBuckets)
       return { url: "" }
     }
     const website = yield* Website.pipe(adopt(false))
