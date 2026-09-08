@@ -1,16 +1,25 @@
+import { deriveObjectRecoveryToken } from "./sylph-object-token"
+import { deployedUrl } from "./sylph-deploy-plan"
 import { spawnSync } from "node:child_process"
 import { Effect, Schema } from "effect"
 import { CloudflareRecoveryGroup } from "../src/recovery/group"
+import { verifyObjectRecoveryDrill } from "../src/recovery/object-drill"
 import { verifyR2RecoveryDrill } from "../src/recovery/r2-drill"
 import { verifyRecoveryDrill } from "../src/recovery/drill"
 import { CloudflareD1Recovery } from "../src/recovery/recovery"
 import { reviewMigrations, reviewRecoveryPlan } from "./sylph-release-review"
+import { queueConsumerEnabled } from "./sylph-queue-consumers"
+import {
+  replayManagedQueues,
+  requireEmptyQueueJournals,
+} from "./sylph-queue-replay"
 import { sylphResources } from "./sylph-resources"
 import {
   recoveryConfiguration,
   requiredReleaseValue as required,
   recoveryGroupId,
   assertRecoveryGroup,
+  managedRecoveryReceipts,
 } from "./sylph-recovery-config"
 
 import { RecoveryProbe, secretFingerprints } from "../src/recovery/verification"
@@ -39,16 +48,13 @@ const emit = (marker: string, value: unknown) =>
   process.stdout.write(`${marker}=${JSON.stringify(value)}\n`)
 
 const main = async () => {
+  let objectBootstrapURL: string | undefined
   if (action === "review") {
     reviewRecoveryPlan(
       required("SYLPH_RESOURCE_PLAN"),
       sylphResources(process.env)
     )
-    let evidence = reviewMigrations(
-      process.env.SYLPH_RECOVERY_POINT ? null : baseCommit,
-      commit,
-      baseCommit
-    )
+    let recoveryTargetCommit: string | undefined
     if (process.env.SYLPH_RECOVERY_POINT) {
       const target = Schema.decodeUnknownSync(
         Schema.Struct({
@@ -56,12 +62,28 @@ const main = async () => {
           baseCommit: Schema.NullOr(Schema.String),
         })
       )(JSON.parse(process.env.SYLPH_RECOVERY_POINT))
-      if ((target.baseCommit ?? target.commit) !== commit)
+      recoveryTargetCommit = target.baseCommit ?? target.commit
+      if (recoveryTargetCommit !== commit)
         throw new Error(
           "Recovery target does not match selected immutable baseline"
         )
-      evidence = `Selected recovery restores the matching data schema and secret versions before deployment. ${evidence}`
+      const { point, id } = recoveryGroupId()
+      const { layer, groupLayer } = await recoveryConfiguration(false)
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const groups = yield* CloudflareRecoveryGroup
+          assertRecoveryGroup(point, yield* groups.read(id))
+        }).pipe(Effect.provide(groupLayer([])), Effect.provide(layer))
+      )
     }
+    let evidence = reviewMigrations(
+      recoveryTargetCommit ? null : baseCommit,
+      commit,
+      baseCommit,
+      recoveryTargetCommit
+    )
+    if (recoveryTargetCommit)
+      evidence = `Selected recovery restores the matching data schema and secret versions before deployment. ${evidence}`
     emit("SYLPH_MIGRATION_REVIEW", { ...identity, compatible: true, evidence })
     return
   }
@@ -147,6 +169,83 @@ const main = async () => {
     )
     if (bootstrap.status !== 0)
       throw new Error("Initial recovery infrastructure provisioning failed")
+    const managed = sylphResources(process.env)
+    if (
+      managed.durableObjects.length ||
+      Object.keys(managed.kvBindings).length ||
+      Object.keys(managed.queueBindings).length
+    ) {
+      const initial = await recoveryConfiguration(true, { skipObjects: true })
+      const initialSecrets = {
+        ...Schema.decodeUnknownSync(
+          Schema.Record(Schema.String, Schema.String)
+        )(JSON.parse(required("SYLPH_RECOVERY_SECRETS"))),
+      }
+      if (managed.durableObjects.length)
+        initialSecrets.SYLPH_RECOVERY_OBJECT_TOKEN =
+          await deriveObjectRecoveryToken(required("SYLPH_RECOVERY_KEY"))
+      if (
+        !initialSecrets.BETTER_AUTH_SECRET ||
+        initialSecrets.BETTER_AUTH_SECRET.length < 32
+      )
+        throw new Error(
+          "Initial managed publication requires the exact application auth secret"
+        )
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          yield* verifyRecoveryDrill(initial.configuration, {
+            databaseId: initial.drillDatabaseId,
+            applicationDatabaseId: initial.databaseId,
+            expectedName: initial.resources.drillDatabaseName,
+            releaseId: `drill-${deploymentId}`,
+          })
+          if (initial.resources.drillBucketName)
+            yield* verifyR2RecoveryDrill(initial.r2Configuration, {
+              bucketName: initial.resources.drillBucketName,
+              applicationBucketNames: initial.resources.bucketNames,
+              releaseId: `r2-drill-${deploymentId}`,
+            })
+          const recovery = yield* CloudflareD1Recovery
+          yield* recovery.stageSecrets(deploymentId, initialSecrets)
+          yield* recovery.pause(deploymentId)
+        }).pipe(Effect.provide(initial.layer))
+      )
+      const publish = spawnSync(
+        "bun",
+        ["x", "alchemy", "deploy", "--stage", "production"],
+        {
+          env: {
+            ...process.env,
+            SYLPH_BOOTSTRAP_RECOVERY: "",
+            BETTER_AUTH_SECRET: initialSecrets.BETTER_AUTH_SECRET,
+            SYLPH_PROJECT_SECRETS: JSON.stringify(
+              Object.fromEntries(
+                Object.entries(initialSecrets).filter(
+                  ([name]) =>
+                    ![
+                      "BETTER_AUTH_SECRET",
+                      "SYLPH_RECOVERY_VERIFY_TOKEN",
+                      "SYLPH_RECOVERY_OBJECT_TOKEN",
+                    ].includes(name)
+                )
+              )
+            ),
+            SYLPH_RECOVERY_VERIFY_TOKEN: required(
+              "SYLPH_RECOVERY_VERIFY_TOKEN"
+            ),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 300_000,
+        }
+      )
+      if (publish.status !== 0)
+        throw new Error(
+          "Initial object Worker publication failed; keep the writer pause"
+        )
+      objectBootstrapURL = deployedUrl(publish.stdout.toString()) ?? undefined
+      if (!objectBootstrapURL)
+        throw new Error("Initial object Worker URL was not observed")
+    }
   }
   const {
     databaseId,
@@ -154,14 +253,21 @@ const main = async () => {
     resources,
     configuration,
     r2Configuration,
+    managedQueues,
+    objectConfiguration,
     groupLayer,
     layer,
-  } = await recoveryConfiguration(action === "prepare" || action === "restore")
+  } = await recoveryConfiguration(
+    action === "prepare" || action === "restore",
+    { objectURL: objectBootstrapURL }
+  )
   await Effect.runPromise(
     Effect.gen(function* () {
       const recovery = yield* CloudflareD1Recovery
       if (action === "prepare") {
-        let liveReleaseId: string | undefined
+        let liveReleaseId: string | undefined = objectBootstrapURL
+          ? deploymentId
+          : undefined
         if (baseCommit) {
           const baseline = awaitProbe(required("SYLPH_BASE_URL"))
           const live = yield* Effect.tryPromise(() => baseline)
@@ -169,7 +275,7 @@ const main = async () => {
             throw new Error("Baseline deployment identity mismatch")
           liveReleaseId = live.releaseId
         }
-        if (!baseCommit) {
+        if (!baseCommit && !objectBootstrapURL) {
           yield* verifyRecoveryDrill(configuration, {
             databaseId: drillDatabaseId,
             applicationDatabaseId: databaseId,
@@ -198,6 +304,24 @@ const main = async () => {
         )
           yield* recovery.adoptPause(gate.owner, deploymentId)
         yield* recovery.pause(deploymentId)
+        yield* Effect.promise(() =>
+          requireEmptyQueueJournals(
+            configuration,
+            managedQueues.filter(
+              (queue) => !queueConsumerEnabled(queue.bindingName)
+            ),
+            deploymentId
+          )
+        )
+        if (objectBootstrapURL)
+          for (const namespaceId of new Set(
+            objectConfiguration.identities.map((item) => item.namespaceId)
+          ))
+            yield* verifyObjectRecoveryDrill(
+              objectConfiguration,
+              namespaceId,
+              deploymentId
+            )
         const manifest = yield* recovery.capture({
           databaseId,
           releaseId: deploymentId,
@@ -220,7 +344,11 @@ const main = async () => {
         }
         const group = yield* Effect.gen(function* () {
           const groups = yield* CloudflareRecoveryGroup
-          return yield* (baseCommit ? groups.capture : groups.captureInitial)({
+          return yield* (
+            baseCommit || objectBootstrapURL
+              ? groups.capture
+              : groups.captureInitial
+          )({
             releaseId: deploymentId,
             liveReleaseId,
           })
@@ -236,6 +364,7 @@ const main = async () => {
           writesPaused: true,
           inventoryComplete: true,
           resources: [
+            ...managedRecoveryReceipts(group),
             ...group.databases.map((database) => ({
               kind: "database",
               id: database.databaseId,
@@ -259,6 +388,24 @@ const main = async () => {
         return
       }
       if (action === "resume") {
+        yield* Effect.promise(() =>
+          requireEmptyQueueJournals(
+            configuration,
+            managedQueues.filter(
+              (queue) => !queueConsumerEnabled(queue.bindingName)
+            ),
+            deploymentId
+          )
+        )
+        yield* Effect.promise(() =>
+          replayManagedQueues(
+            configuration,
+            managedQueues.filter((queue) =>
+              queueConsumerEnabled(queue.bindingName)
+            ),
+            deploymentId
+          )
+        )
         yield* recovery.resume(deploymentId)
         return
       }

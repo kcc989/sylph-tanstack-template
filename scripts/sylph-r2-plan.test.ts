@@ -99,6 +99,6 @@ test("source declarations reject duplicate suffixes, reserved bindings and inval
     ),
   ])
     expect(() => sylphResources(environment, invalid)).toThrow(
-      "bucket declarations"
+      "storage declarations"
     )
 })

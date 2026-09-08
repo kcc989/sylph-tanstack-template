@@ -1,4 +1,5 @@
 import { Context, Effect, Layer, Schema } from "effect"
+import { RecoveryObjectsResponse } from "./object-domain"
 import {
   CloudflareRecoveryFailure,
   D1RecoveryManifest,
@@ -6,6 +7,7 @@ import {
   RecoveryBookmarkResponse,
   RecoveryGate,
   RecoveryQueryResponse,
+  RecoveryQueuesResponse,
   RecoveryRestoreResponse,
   RecoverySchemaRows,
   RecoverySecretValues,
@@ -420,9 +422,106 @@ const createRecovery = (
       .sort()
     if (JSON.stringify(declaredSecrets) !== JSON.stringify(actualSecrets))
       throw new Error("Secret inventory mismatch")
+    const managedKv = input.managedKv ?? []
+    const managedQueues = input.managedQueues ?? []
+    const managed = [...managedKv, ...managedQueues]
+    if (
+      new Set(managed.map((binding) => binding.bindingName)).size !==
+        managed.length ||
+      managed.some(
+        (binding) => !input.databaseIds.includes(binding.databaseId)
+      ) ||
+      (input.queueConsumers ?? []).some(
+        (queue) => !input.databaseIds.includes(queue.databaseId)
+      )
+    )
+      throw new Error(
+        "Managed bindings require unique names and a captured application journal"
+      )
+    const kvBindings = response.result.bindings.filter(
+      (binding) => binding.type === "kv_namespace"
+    )
+    if (
+      kvBindings.length !== managedKv.length ||
+      kvBindings.some(
+        (binding) =>
+          !managedKv.some(
+            (managed) =>
+              managed.bindingName === binding.name &&
+              managed.namespaceId === binding.namespace_id
+          )
+      )
+    )
+      throw new Error("KV bindings require exact managed journal declarations")
+    const queueBindings = response.result.bindings.filter(
+      (binding) => binding.type === "queue"
+    )
+    if (
+      queueBindings.length !== managedQueues.length ||
+      queueBindings.some(
+        (binding) =>
+          !managedQueues.some(
+            (managed) =>
+              managed.bindingName === binding.name &&
+              managed.queueName === binding.queue_name
+          )
+      )
+    )
+      throw new Error(
+        "Queue bindings require exact managed journal declarations"
+      )
+    const registered = input.durableObjects ?? []
+    const objectBindings = response.result.bindings.filter(
+      (binding) => binding.type === "durable_object_namespace"
+    )
+    if (
+      new Set(registered.map((entry) => entry.bindingName)).size !==
+        registered.length ||
+      objectBindings.length !== registered.length ||
+      objectBindings.some(
+        (binding) =>
+          !registered.some(
+            (entry) =>
+              entry.bindingName === binding.name &&
+              entry.namespaceId === binding.namespace_id
+          )
+      )
+    )
+      throw new Error(
+        "Durable Object bindings require exact registered namespace declarations"
+      )
+    for (const entry of registered) {
+      const seen = new Set<string>()
+      const cursors = new Set<string>()
+      let cursor = ""
+      for (let page = 0; page < 100; page++) {
+        const response = Schema.decodeUnknownSync(RecoveryObjectsResponse)(
+          await request(
+            `/workers/durable_objects/namespaces/${encodeURIComponent(entry.namespaceId)}/objects?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`
+          )
+        )
+        for (const object of response.result) {
+          if (seen.has(object.id) || !entry.objectIds.includes(object.id))
+            throw new Error("Namespace contains an unregistered object")
+          seen.add(object.id)
+        }
+        cursor = response.result_info?.cursor ?? ""
+        if (!cursor) {
+          if (response.result.length >= 100)
+            throw new Error("Object inventory pagination is incomplete")
+          break
+        }
+        if (cursors.has(cursor) || page === 99)
+          throw new Error("Object inventory cursor repeats or exceeds bound")
+        cursors.add(cursor)
+      }
+    }
     const safeBindings = new Set([
       "d1",
       "r2_bucket",
+      "durable_object_namespace",
+      "kv_namespace",
+      "queue",
       "secret_text",
       "plain_text",
       "json",
@@ -473,8 +572,132 @@ const createRecovery = (
     )
       throw new Error("Scheduled writers are unsupported")
   }
+  const inventoryQueues = async (topology: RecoveryTopology) => {
+    const queues: Array<(typeof RecoveryQueuesResponse.Type.result)[number]> =
+      []
+    let total = 0
+    for (let page = 1; page <= 100; page++) {
+      const response = Schema.decodeUnknownSync(RecoveryQueuesResponse)(
+        await request(`/queues?page=${page}&per_page=100`)
+      )
+      if (
+        response.result_info.page !== page ||
+        response.result_info.total_pages > 100
+      )
+        throw new Error("Queue inventory pagination is invalid")
+      if (page > 1 && total !== response.result_info.total_count)
+        throw new Error("Queue inventory changed during inspection")
+      total = response.result_info.total_count
+      if (
+        response.result.some((queue) =>
+          queue.consumers.some(
+            (consumer) =>
+              consumer.script &&
+              consumer.script_name &&
+              consumer.script !== consumer.script_name
+          )
+        )
+      )
+        throw new Error("Queue consumer identity aliases disagree")
+      queues.push(...response.result)
+      if (page >= response.result_info.total_pages) break
+    }
+    if (
+      queues.length !== total ||
+      new Set(queues.map((queue) => queue.queue_id)).size !== queues.length
+    )
+      throw new Error("Queue inventory is incomplete")
+    for (const worker of topology.workers) {
+      const declared = worker.queueConsumers ?? []
+      const actual = queues.filter((queue) =>
+        queue.consumers.some(
+          (consumer) =>
+            (consumer.script_name ?? consumer.script) === worker.workerName
+        )
+      )
+      if (
+        actual.some(
+          (queue) =>
+            !declared.some(
+              (consumer) =>
+                consumer.queueId === queue.queue_id &&
+                consumer.queueName === queue.queue_name
+            )
+        )
+      )
+        throw new Error(
+          "Queue consumer inventory differs from reviewed managed consumers"
+        )
+    }
+    const declarations = topology.workers.flatMap((worker) => [
+      ...(worker.managedQueues ?? []).map((queue) => ({
+        ...queue,
+        workerName: worker.workerName,
+        role: "producer",
+      })),
+      ...(worker.queueConsumers ?? []).map((queue) => ({
+        ...queue,
+        workerName: worker.workerName,
+        role: "consumer",
+      })),
+    ])
+    for (const declaration of declarations) {
+      const queue = queues.find(
+        (queue) =>
+          queue.queue_id === declaration.queueId &&
+          queue.queue_name === declaration.queueName
+      )
+      if (
+        !queue ||
+        queue.consumers.length !== queue.consumers_total_count ||
+        queue.producers.length !== queue.producers_total_count
+      )
+        throw new Error("Managed queue inventory is unavailable or truncated")
+      const related = declarations.filter(
+        (value) => value.queueId === declaration.queueId
+      )
+      if (
+        related.some(
+          (value) =>
+            value.databaseId !== declaration.databaseId ||
+            value.queueName !== declaration.queueName
+        )
+      )
+        throw new Error(
+          "Managed queue declarations disagree on journal identity"
+        )
+      if (
+        queue.consumers.length > 1 ||
+        queue.consumers.some(
+          (consumer) =>
+            consumer.type !== "worker" ||
+            !related.some(
+              (value) =>
+                value.role === "consumer" &&
+                value.workerName === (consumer.script_name ?? consumer.script)
+            )
+        )
+      )
+        throw new Error("Managed queues allow at most one owned gated consumer")
+      if (
+        new Set(queue.producers.map((producer) => producer.script)).size !==
+          queue.producers.length ||
+        queue.producers.some(
+          (producer) =>
+            producer.type !== "worker" ||
+            !related.some(
+              (value) =>
+                value.role === "producer" &&
+                value.workerName === producer.script
+            )
+        )
+      )
+        throw new Error("Managed queues cannot have unreviewed producers")
+    }
+  }
   const inventoryTopology = async (value: RecoveryTopology) => {
     const topology = Schema.decodeUnknownSync(RecoveryTopology)(value)
+    await inventoryQueues(topology)
     const names = new Set(topology.workers.map((worker) => worker.workerName))
     if (names.size !== topology.workers.length)
       throw new Error("Worker inventory contains duplicates")

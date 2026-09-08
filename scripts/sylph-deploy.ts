@@ -1,3 +1,5 @@
+import { deriveObjectRecoveryToken } from "./sylph-object-token"
+import { sylphResources } from "./sylph-resources"
 import { Effect, Schema } from "effect"
 import { CloudflareRecoveryGroup } from "../src/recovery/group"
 import { CloudflareD1Recovery } from "../src/recovery/recovery"
@@ -7,7 +9,6 @@ import {
   requiredReleaseValue,
   assertRecoveryGroup,
 } from "./sylph-recovery-config"
-import { sylphResources } from "./sylph-resources"
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { dirname, resolve } from "node:path"
@@ -105,6 +106,12 @@ const main = async () => {
           selected = Schema.decodeUnknownSync(
             Schema.Record(Schema.String, Schema.String)
           )(JSON.parse(requiredReleaseValue("SYLPH_RECOVERY_SECRETS")))
+        if (sylphResources(process.env).durableObjects.length)
+          selected.SYLPH_RECOVERY_OBJECT_TOKEN = yield* Effect.promise(() =>
+            deriveObjectRecoveryToken(
+              requiredReleaseValue("SYLPH_RECOVERY_KEY")
+            )
+          )
         yield* recovery.stageSecrets(
           requiredReleaseValue("SYLPH_RELEASE_ID"),
           selected
@@ -118,7 +125,8 @@ const main = async () => {
         Object.entries(secrets).filter(
           ([name]) =>
             name !== "BETTER_AUTH_SECRET" &&
-            name !== "SYLPH_RECOVERY_VERIFY_TOKEN"
+            name !== "SYLPH_RECOVERY_VERIFY_TOKEN" &&
+            name !== "SYLPH_RECOVERY_OBJECT_TOKEN"
         )
       )
     )

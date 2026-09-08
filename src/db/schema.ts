@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm"
 import {
   index,
   integer,
+  primaryKey,
   sqliteTable,
   text,
   uniqueIndex,
@@ -92,4 +93,37 @@ export const verification = sqliteTable(
     updatedAt: timestamp("updated_at"),
   },
   (table) => [index("verification_identifier_idx").on(table.identifier)]
+)
+
+export const managedKvJournal = sqliteTable(
+  "sylph_managed_kv",
+  {
+    namespace: text("namespace").notNull(),
+    key: text("key").notNull(),
+    version: text("version").notNull(),
+    value: text("value").notNull(),
+    digest: text("digest").notNull(),
+    metadata: text("metadata").notNull(),
+    expiration: integer("expiration"),
+  },
+  (table) => [primaryKey({ columns: [table.namespace, table.key] })]
+)
+
+export const managedQueueJournal = sqliteTable(
+  "sylph_recovery_queue",
+  {
+    queue: text("queue").notNull(),
+    id: text("id").notNull(),
+    body: text("body").notNull(),
+    createdAt: integer("created_at").notNull(),
+    completedAt: integer("completed_at"),
+  },
+  (table) => [
+    primaryKey({ columns: [table.queue, table.id] }),
+    index("sylph_recovery_queue_pending").on(
+      table.queue,
+      table.completedAt,
+      table.id
+    ),
+  ]
 )

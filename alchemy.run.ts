@@ -1,7 +1,12 @@
+import { deriveObjectRecoveryToken } from "./scripts/sylph-object-token"
+import { queueConsumerEnabled } from "./scripts/sylph-queue-consumers"
 import { sylphState } from "./scripts/sylph-broker"
 import * as Redacted from "effect/Redacted"
 import {
   applicationBucketBindings,
+  managedKvBindings,
+  managedQueueBindings,
+  managedDurableObjectBindings,
   sylphResources,
   sylphSecrets,
 } from "./scripts/sylph-resources"
@@ -44,6 +49,29 @@ const ApplicationBuckets = Object.fromEntries(
   ])
 )
 
+const ManagedKvCaches = Object.fromEntries(
+  Object.keys(managedKvBindings).map((binding) => [
+    binding,
+    Cloudflare.KV.Namespace(`ManagedKv-${binding}`, {
+      title: resources?.kvBindings[binding],
+    }).pipe(
+      adopt(false),
+      retain(process.env.SYLPH_DEPLOYMENT === "production")
+    ),
+  ])
+)
+const ManagedQueues = Object.fromEntries(
+  Object.keys(managedQueueBindings).map((binding) => [
+    binding,
+    Cloudflare.Queues.Queue(`ManagedQueue-${binding}`, {
+      name: resources?.queueBindings[binding],
+    }).pipe(
+      adopt(false),
+      retain(process.env.SYLPH_DEPLOYMENT === "production")
+    ),
+  ])
+)
+
 const RecoveryBucketDrill = Object.keys(applicationBucketBindings).length
   ? Cloudflare.R2.Bucket("RecoveryBucketDrill", {
       name: resources?.drillBucketName,
@@ -53,9 +81,18 @@ const RecoveryBucketDrill = Object.keys(applicationBucketBindings).length
 export class Website extends Cloudflare.Website.Vite<Website>()(
   "Website",
   Effect.gen(function* () {
+    const objectToken =
+      process.env.SYLPH_DEPLOYMENT === "production" &&
+      Object.keys(managedDurableObjectBindings).length
+        ? yield* Effect.promise(() =>
+            deriveObjectRecoveryToken(process.env.SYLPH_RECOVERY_KEY ?? "")
+          )
+        : ""
     const database = yield* Database
     const recoveryControl = yield* RecoveryControl
     const buckets = yield* Effect.all(ApplicationBuckets)
+    const kv = yield* Effect.all(ManagedKvCaches)
+    const queues = yield* Effect.all(ManagedQueues)
 
     return {
       name: resources?.workerName,
@@ -77,7 +114,28 @@ export class Website extends Cloudflare.Website.Vite<Website>()(
             Redacted.make(value),
           ])
         ),
+        ...Object.fromEntries(
+          Object.entries(managedDurableObjectBindings).map(
+            ([binding, value]) => [
+              binding,
+              Cloudflare.DurableObject(binding, { className: value.className }),
+            ]
+          )
+        ),
         ...buckets,
+        ...kv,
+        ...queues,
+        SYLPH_MANAGED_QUEUE_NAMES: JSON.stringify(
+          Object.fromEntries(
+            Object.entries(queues).map(([binding, queue]) => [
+              binding,
+              queue.queueName,
+            ])
+          )
+        ),
+        ...(Object.keys(managedDurableObjectBindings).length
+          ? { SYLPH_RECOVERY_OBJECT_TOKEN: Redacted.make(objectToken) }
+          : {}),
         BETTER_AUTH_SECRET: Config.redacted("BETTER_AUTH_SECRET"),
         DB: database,
         SYLPH_RECOVERY_CONTROL: recoveryControl,
@@ -125,9 +183,20 @@ export default Alchemy.Stack(
       yield* Database
       yield* RecoveryControl
       yield* Effect.all(ApplicationBuckets)
+      yield* Effect.all(ManagedKvCaches)
+      yield* Effect.all(ManagedQueues)
       return { url: "" }
     }
     const website = yield* Website.pipe(adopt(false))
+    for (const [binding, resource] of Object.entries(ManagedQueues)) {
+      if (!queueConsumerEnabled(binding)) continue
+      const queue = yield* resource
+      yield* Cloudflare.Queues.Consumer(`ManagedQueueConsumer-${binding}`, {
+        queueId: queue.queueId,
+        scriptName: website.workerName,
+        settings: { batchSize: 10, maxConcurrency: 1 },
+      }).pipe(adopt(false))
+    }
 
     return {
       url: website.url.as<string>(),

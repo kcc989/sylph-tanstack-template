@@ -7,6 +7,7 @@ import {
 } from "./domain"
 import { CloudflareD1Recovery, type RecoveryConfiguration } from "./recovery"
 import { CloudflareR2Recovery } from "./r2"
+import { CloudflareObjectRecovery } from "./object"
 
 type Result<A> = Effect.Effect<A, CloudflareRecoveryFailure>
 type Capture = { releaseId: string; liveReleaseId?: string }
@@ -56,15 +57,54 @@ export const CloudflareRecoveryGroupLive = (
       if (bucketNames.length > 0 && Option.isNone(optionalBuckets))
         throw new Error("R2 recovery requires its configured adapter")
       const buckets = Option.getOrUndefined(optionalBuckets)
+      const objectIdentities = [
+        ...new Map(
+          topology.workers
+            .flatMap((worker) =>
+              (worker.durableObjects ?? []).flatMap((entry) =>
+                entry.objectIds.map((objectId) => ({
+                  namespaceId: entry.namespaceId,
+                  objectId,
+                }))
+              )
+            )
+            .map((identity) => [JSON.stringify(identity), identity])
+        ).values(),
+      ].sort((left, right) =>
+        JSON.stringify(left).localeCompare(JSON.stringify(right))
+      )
+      if (objectIdentities.length > 100)
+        throw new Error("Registered object inventory exceeds group bound")
+      const optionalObjects = yield* Effect.serviceOption(
+        CloudflareObjectRecovery
+      )
+      if (objectIdentities.length > 0 && Option.isNone(optionalObjects))
+        throw new Error(
+          "Registered objects require their configured recovery adapter"
+        )
+      const objects = Option.getOrUndefined(optionalObjects)
       const now = configuration.now ?? Date.now
       const topologyIdentity = (value: RecoveryTopology) =>
         JSON.stringify(
           value.workers.map(
-            ({ workerName, databaseIds, serviceTargets, bucketNames }) => ({
+            ({
+              workerName,
+              databaseIds,
+              serviceTargets,
+              bucketNames,
+              managedKv,
+              managedQueues,
+              queueConsumers,
+              durableObjects,
+            }) => ({
               workerName,
               databaseIds,
               serviceTargets,
               bucketNames: bucketNames ?? [],
+              managedKv: managedKv ?? [],
+              managedQueues: managedQueues ?? [],
+              queueConsumers: queueConsumers ?? [],
+              durableObjects: durableObjects ?? [],
             })
           )
         )
@@ -167,6 +207,27 @@ export const CloudflareRecoveryGroupLive = (
             )
           )
             throw new Error("Group contains mismatched bucket recovery points")
+          if (
+            JSON.stringify(
+              (group.objects ?? [])
+                .map((point) => point.identity)
+                .sort((left, right) =>
+                  JSON.stringify(left).localeCompare(JSON.stringify(right))
+                )
+            ) !== JSON.stringify(objectIdentities)
+          )
+            throw new Error(
+              "Group must cover every registered object exactly once"
+            )
+          if (
+            (group.objects ?? []).some(
+              (point) =>
+                point.projectId !== group.projectId ||
+                point.releaseId !== group.releaseId ||
+                point.expiresAt < group.expiresAt
+            )
+          )
+            throw new Error("Group contains mismatched object recovery points")
           return group
         })
       })
@@ -214,6 +275,11 @@ export const CloudflareRecoveryGroupLive = (
                 releaseId: input.releaseId,
               })
             )
+        const objectPoints: NonNullable<D1RecoveryGroup["objects"]>[number][] =
+          []
+        if (objects)
+          for (const identity of objectIdentities)
+            objectPoints.push(yield* objects.capture(identity, input.releaseId))
         for (const point of databases) {
           const actual = yield* recovery.fingerprint(point.databaseId)
           if (actual.fingerprint !== point.fingerprint)
@@ -225,6 +291,13 @@ export const CloudflareRecoveryGroupLive = (
             if (actual.fingerprint !== point.fingerprint)
               return yield* fail("Bucket changed during group capture")
           }
+        if (objects)
+          for (const point of objectPoints)
+            if (
+              (yield* objects.fingerprint(point.identity, input.releaseId)) !==
+              point.fingerprint
+            )
+              return yield* fail("Object changed during group capture")
         yield* paused(input.releaseId)
         const group = Schema.decodeUnknownSync(D1RecoveryGroup)({
           version: 1,
@@ -233,11 +306,14 @@ export const CloudflareRecoveryGroupLive = (
           releaseId: input.releaseId,
           capturedAt: now(),
           expiresAt: Math.min(
-            ...[...databases, ...bucketPoints].map((point) => point.expiresAt)
+            ...[...databases, ...bucketPoints, ...objectPoints].map(
+              (point) => point.expiresAt
+            )
           ),
           topology,
           databases,
           buckets: bucketNames.length ? bucketPoints : undefined,
+          objects: objectIdentities.length ? objectPoints : undefined,
         })
         const json = JSON.stringify(group)
         const hash = yield* attempt("Hash recovery group", () => digest(json))
@@ -300,6 +376,26 @@ export const CloudflareRecoveryGroupLive = (
               return yield* fail("Undo group no longer matches current bucket")
           }
         }
+        if (objects) {
+          for (const point of [
+            ...(target.objects ?? []),
+            ...(undo.objects ?? []),
+          ]) {
+            if (
+              JSON.stringify(yield* objects.read(point.id)) !==
+              JSON.stringify(point)
+            )
+              return yield* fail("Require immutable object group members")
+          }
+          for (const point of target.objects ?? [])
+            yield* objects.preflightRestore(point, releaseId)
+          for (const point of undo.objects ?? [])
+            if (
+              (yield* objects.fingerprint(point.identity, releaseId)) !==
+              point.fingerprint
+            )
+              return yield* fail("Undo group no longer matches object state")
+        }
         for (const point of undo.databases) {
           const actual = yield* recovery.fingerprint(point.databaseId)
           if (actual.fingerprint !== point.fingerprint)
@@ -318,6 +414,9 @@ export const CloudflareRecoveryGroupLive = (
         const program = Effect.gen(function* () {
           for (const point of target.databases)
             yield* recovery.restore(point, releaseId)
+          if (objects)
+            for (const point of target.objects ?? [])
+              yield* objects.restore(point, releaseId)
           if (buckets)
             for (const point of target.buckets ?? [])
               yield* buckets.restore(point, releaseId)
@@ -332,6 +431,13 @@ export const CloudflareRecoveryGroupLive = (
               if (actual.fingerprint !== point.fingerprint)
                 return yield* fail("Verify coordinated restored bucket")
             }
+          if (objects)
+            for (const point of target.objects ?? [])
+              if (
+                (yield* objects.fingerprint(point.identity, releaseId)) !==
+                point.fingerprint
+              )
+                return yield* fail("Verify coordinated restored object")
           yield* paused(releaseId)
           yield* query(
             "UPDATE sylph_recovery_group_operation SET phase = 'verified' WHERE release_id = ? AND group_id = ? AND phase = 'restoring'",

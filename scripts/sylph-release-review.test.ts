@@ -120,12 +120,12 @@ test("an actual release review rejects control-data migrations even during recov
     const baseline = commit()
     const module = new URL("./sylph-release-review.ts", import.meta.url)
       .pathname
-    const run = (base: string | null, head: string) =>
+    const run = (base: string | null, head: string, target?: string) =>
       spawnSync(
         Bun.which("bun") ?? "bun",
         [
           "-e",
-          `import { reviewMigrations } from ${JSON.stringify(module)}; reviewMigrations(${JSON.stringify(base)}, ${JSON.stringify(head)}, ${JSON.stringify(baseline)})`,
+          `import { reviewMigrations } from ${JSON.stringify(module)}; reviewMigrations(${JSON.stringify(base)}, ${JSON.stringify(head)}, ${JSON.stringify(baseline)}, ${JSON.stringify(target)})`,
         ],
         { cwd: directory, encoding: "utf8", timeout: 15000 }
       )
@@ -135,6 +135,12 @@ test("an actual release review rejects control-data migrations even during recov
       "DELETE FROM gate;"
     )
     const changed = commit()
+    expect(run(null, changed, baseline).stderr).toContain(
+      "Verified recovery target differs"
+    )
+    expect(run(null, changed, changed).stderr).toContain(
+      "Recovery infrastructure changed"
+    )
     for (const base of [baseline, null]) {
       const result = run(base, changed)
       expect(result.status).not.toBe(0)

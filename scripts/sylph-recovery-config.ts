@@ -1,4 +1,7 @@
+import { deriveObjectRecoveryToken } from "./sylph-object-token"
 import { Layer, Schema } from "effect"
+import { CloudflareObjectRecoveryLive } from "../src/recovery/object"
+import { inspectManagedObjects } from "./sylph-object-config"
 import { CloudflareRecoveryGroupLive } from "../src/recovery/group"
 import { CloudflareD1RecoveryLive } from "../src/recovery/recovery"
 import { CloudflareR2RecoveryLive } from "../src/recovery/r2"
@@ -14,7 +17,10 @@ export const requiredReleaseValue = (name: string) => {
   return value
 }
 
-export const recoveryConfiguration = async (needsSecretKey = true) => {
+export const recoveryConfiguration = async (
+  needsSecretKey = true,
+  options: { skipObjects?: boolean; objectURL?: string } = {}
+) => {
   const accountId = requiredReleaseValue("CLOUDFLARE_ACCOUNT_ID")
   const apiToken = requiredReleaseValue("CLOUDFLARE_API_TOKEN")
   const encryptionKey = needsSecretKey
@@ -61,6 +67,101 @@ export const recoveryConfiguration = async (needsSecretKey = true) => {
   const secrets = Schema.decodeUnknownSync(
     Schema.Record(Schema.String, Schema.String)
   )(JSON.parse(process.env.SYLPH_RECOVERY_SECRETS ?? "{}"))
+  const managedInventory = async (path: string) => {
+    const response = await fetch(`${apiBaseUrl}/${path}?per_page=1000`, {
+      headers: { Authorization: `Bearer ${apiToken}` },
+      redirect: "error",
+      signal: AbortSignal.timeout(30_000),
+    })
+    if (!response.ok)
+      throw new Error("Cannot inspect declared managed resources")
+    return Schema.decodeUnknownSync(
+      Schema.Struct({
+        success: Schema.Literal(true),
+        result: Schema.Array(
+          Schema.Struct({
+            id: Schema.optional(Schema.String),
+            title: Schema.optional(Schema.String),
+            queue_id: Schema.optional(Schema.String),
+            queue_name: Schema.optional(Schema.String),
+          })
+        ),
+      })
+    )(await response.json()).result
+  }
+  const kvInventory = Object.keys(resources.kvBindings).length
+    ? await managedInventory("storage/kv/namespaces")
+    : []
+  const queueInventory = Object.keys(resources.queueBindings).length
+    ? await managedInventory("queues")
+    : []
+  const managedKv = Object.entries(resources.kvBindings).map(
+    ([bindingName, name]) => {
+      const selected = kvInventory.filter((item) => item.title === name)
+      const namespaceId = selected[0]?.id
+      if (selected.length !== 1 || !namespaceId)
+        throw new Error("Declared managed KV namespace is missing or ambiguous")
+      return { bindingName, namespaceId, databaseId }
+    }
+  )
+  const managedQueues = Object.entries(resources.queueBindings).map(
+    ([bindingName, queueName]) => {
+      const selected = queueInventory.filter(
+        (item) => item.queue_name === queueName
+      )
+      const queueId = selected[0]?.queue_id
+      if (selected.length !== 1 || !queueId)
+        throw new Error("Declared managed Queue is missing or ambiguous")
+      return { bindingName, queueId, queueName, databaseId }
+    }
+  )
+  let objectURL =
+    options.objectURL ??
+    process.env.SYLPH_PRODUCTION_URL ??
+    process.env.SYLPH_BASE_URL
+  if (!objectURL && !options.skipObjects && resources.durableObjects.length) {
+    if (resources.hostname) objectURL = `https://${resources.hostname}`
+    else {
+      const response = await fetch(`${apiBaseUrl}/workers/subdomain`, {
+        headers: { Authorization: `Bearer ${apiToken}` },
+        redirect: "error",
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!response.ok)
+        throw new Error("Cannot resolve the owned object Worker URL")
+      const subdomain = Schema.decodeUnknownSync(
+        Schema.Struct({
+          success: Schema.Literal(true),
+          result: Schema.Struct({
+            subdomain: Schema.String.check(
+              Schema.isPattern(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/)
+            ),
+          }),
+        })
+      )(await response.json()).result.subdomain
+      objectURL = `https://${resources.workerName}.${subdomain}.workers.dev`
+    }
+  }
+  const objects = await inspectManagedObjects(
+    {
+      ...configuration,
+      objectToken: () => deriveObjectRecoveryToken(encryptionKey),
+      expectedCheckpoints: [
+        process.env.SYLPH_BASE_COMMIT,
+        process.env.SYLPH_CHECKPOINT,
+      ].filter((value): value is string => Boolean(value)),
+    },
+    resources.workerName,
+    options.skipObjects ? [] : resources.durableObjects,
+    objectURL,
+    process.env.SYLPH_RECOVERY_VERIFY_TOKEN ?? ""
+  )
+  const objectConfiguration = {
+    ...configuration,
+    identities: objects.identities,
+    transport: objects.transport,
+  }
+  const objectLayer = CloudflareObjectRecoveryLive(objectConfiguration)
   const topology = {
     workers: resources.recoveryWorkers.map((worker) => ({
       workerName: worker.workerName,
@@ -75,7 +176,31 @@ export const recoveryConfiguration = async (needsSecretKey = true) => {
       ...(worker.bucketNames?.length
         ? { bucketNames: worker.bucketNames }
         : {}),
-      secretNames: [...Object.keys(secrets), "SYLPH_RECOVERY_VERIFY_TOKEN"],
+      ...(objects.registrations.length
+        ? { durableObjects: objects.registrations }
+        : {}),
+      ...(managedKv.length ? { managedKv } : {}),
+      ...(managedQueues.length
+        ? {
+            managedQueues,
+            queueConsumers: managedQueues.map(
+              ({ queueId, queueName, databaseId }) => ({
+                queueId,
+                queueName,
+                databaseId,
+              })
+            ),
+          }
+        : {}),
+      secretNames: [
+        ...new Set([
+          ...Object.keys(secrets),
+          "SYLPH_RECOVERY_VERIFY_TOKEN",
+          ...(resources.durableObjects.length
+            ? ["SYLPH_RECOVERY_OBJECT_TOKEN"]
+            : []),
+        ]),
+      ],
     })),
   }
   const r2Configuration = {
@@ -88,12 +213,18 @@ export const recoveryConfiguration = async (needsSecretKey = true) => {
   const d1Layer = CloudflareD1RecoveryLive(configuration)
   return {
     r2Configuration,
+    managedQueues,
+    objectConfiguration,
     databaseId,
     drillDatabaseId,
     resources,
     configuration,
     topology,
-    layer: Layer.merge(d1Layer, CloudflareR2RecoveryLive(r2Configuration)),
+    layer: Layer.mergeAll(
+      d1Layer,
+      CloudflareR2RecoveryLive(r2Configuration),
+      objectLayer
+    ),
     groupLayer: (secretNames: string[]) =>
       CloudflareRecoveryGroupLive({
         ...configuration,
@@ -103,7 +234,7 @@ export const recoveryConfiguration = async (needsSecretKey = true) => {
             secretNames,
           })),
         },
-      }),
+      }).pipe(Layer.provide(objectLayer)),
   }
 }
 
@@ -193,6 +324,23 @@ export const assertRecoveryGroup = (
     ...(group.buckets ?? []).map(
       (bucket) => `object-storage:${bucket.bucketName}`
     ),
+    ...new Set(
+      group.topology.workers.flatMap((worker) =>
+        (worker.managedKv ?? []).map((item) => `kv:${item.namespaceId}`)
+      )
+    ),
+    ...new Set(
+      group.topology.workers.flatMap((worker) =>
+        (worker.managedQueues ?? []).map((item) => `other:${item.queueId}`)
+      )
+    ),
+    ...new Set(
+      group.topology.workers.flatMap((worker) =>
+        (worker.durableObjects ?? []).map(
+          (item) => `durable-object:${item.namespaceId}`
+        )
+      )
+    ),
     ...first.secrets.map((secret) => `secret:${secret.name}`),
   ].sort()
   const actual = point.resources
@@ -208,4 +356,61 @@ export const assertRecoveryGroup = (
     throw new Error(
       "Recovery receipt must cover every group database and exact secret version"
     )
+}
+
+export const managedRecoveryReceipts = (group: D1RecoveryGroup) => {
+  const receipts = new Map<
+    string,
+    { kind: string; id: string; backupRef: string; restoreVerifiedAt: number }
+  >()
+  for (const worker of group.topology.workers) {
+    for (const item of [
+      ...(worker.managedKv ?? []).map((resource) => ({
+        kind: "kv",
+        id: resource.namespaceId,
+        databaseId: resource.databaseId,
+      })),
+      ...(worker.managedQueues ?? []).map((resource) => ({
+        kind: "other",
+        id: resource.queueId,
+        databaseId: resource.databaseId,
+      })),
+    ]) {
+      const database = group.databases.find(
+        (database) => database.databaseId === item.databaseId
+      )
+      if (!database)
+        throw new Error(
+          "Managed resource has no authoritative database recovery point"
+        )
+      receipts.set(`${item.kind}:${item.id}`, {
+        kind: item.kind,
+        id: item.id,
+        backupRef: `group:${group.id}`,
+        restoreVerifiedAt: database.restoreVerifiedAt,
+      })
+    }
+  }
+  for (const worker of group.topology.workers) {
+    for (const registration of worker.durableObjects ?? []) {
+      const points = (group.objects ?? []).filter(
+        (point) =>
+          point.identity.namespaceId === registration.namespaceId &&
+          registration.objectIds.includes(point.identity.objectId)
+      )
+      if (points.length !== registration.objectIds.length)
+        throw new Error(
+          "Object namespace is missing registered recovery proofs"
+        )
+      receipts.set(`durable-object:${registration.namespaceId}`, {
+        kind: "durable-object",
+        id: registration.namespaceId,
+        backupRef: `group:${group.id}`,
+        restoreVerifiedAt: Math.min(
+          ...points.map((point) => point.restoreVerifiedAt)
+        ),
+      })
+    }
+  }
+  return [...receipts.values()]
 }

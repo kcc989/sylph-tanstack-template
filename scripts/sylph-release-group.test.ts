@@ -4,6 +4,7 @@ import { createHash } from "node:crypto"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { sylphResources } from "./sylph-resources"
 import { secretFingerprints } from "../src/recovery/verification"
 
 const prefix = `sylph-${"a".repeat(24)}`
@@ -111,6 +112,12 @@ async function releaseFixture(withBuckets = false) {
         request.headers.get("Authorization") !== "Bearer fixture-provider-token"
       )
         return new Response("Unauthorized", { status: 401 })
+      if (url.pathname.endsWith("/queues"))
+        return Response.json({
+          success: true,
+          result: [],
+          result_info: { page: 1, total_pages: 1, total_count: 0 },
+        })
       if (lookupFailure && url.pathname.endsWith("/settings"))
         return new Response("Provider lookup unavailable", {
           status: lookupFailure,
@@ -653,3 +660,44 @@ test("bucket prepare rejects active lifecycle writers before any object mutation
     await fixture.close()
   }
 }, 60000)
+
+test("recovery review refuses a forged receipt or changed immutable target before source exceptions", async () => {
+  const fixture = await releaseFixture()
+  try {
+    const prepared = await fixture.hook("prepare")
+    expect(prepared.code).toBe(0)
+    fixture.setWorkerExists()
+    const point = {
+      ...recoveryPoint(prepared.stdout),
+      commit,
+      baseCommit: null,
+    }
+    const inputs = {
+      SYLPH_RESOURCE_PLAN: JSON.stringify(
+        sylphResources({ SYLPH_RESOURCE_PREFIX: prefix }).plan
+      ),
+      SYLPH_BASE_COMMIT: commit,
+    }
+    const forged = await fixture.hook("review", {
+      ...inputs,
+      SYLPH_RECOVERY_POINT: JSON.stringify({
+        ...point,
+        deploymentId: "forged",
+      }),
+    })
+    expect(forged.code).toBe(1)
+    expect(forged.stdout).not.toContain("SYLPH_MIGRATION_REVIEW=")
+    const changed = await fixture.hook("review", {
+      ...inputs,
+      SYLPH_RECOVERY_POINT: JSON.stringify({
+        ...point,
+        baseCommit: "b".repeat(40),
+      }),
+    })
+    expect(changed.code).toBe(1)
+    expect(changed.stdout).not.toContain("SYLPH_MIGRATION_REVIEW=")
+    expect(fixture.restores).toEqual(["drill"])
+  } finally {
+    await fixture.close()
+  }
+})

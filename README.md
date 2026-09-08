@@ -85,3 +85,25 @@ First prepare automatically drills R2 restore in the retained scratch bucket. Th
 R2 recovery is bounded to 20 application buckets, 10,000 objects per bucket, 16 MiB per object, 64 MiB of object bytes per bucket, and 96 MiB of encoded snapshot data per bucket. Encrypted immutable chunks are stored in recovery-control D1. Restore verifies complete pagination, bytes, HTTP and custom metadata, and storage class. Object keys with `.` or `..` path segments, customer-provided encryption keys, lifecycle rules that delete objects or change their storage class, locks, Sippy, event notifications, and uncontrolled writers are unsupported. Validated multipart-upload abort rules are allowed because they do not alter completed objects. KV recovery is not provided.
 
 Local tests exercise actual hook processes with SQLite and local object-provider fixtures, including combined D1/R2 restore. These tests are not Cloudflare deployment evidence. Publication, production deployment, destructive restore, and retained-resource cleanup require explicit approval.
+
+## Managed KV and Queues
+
+Declare optional resources once in `scripts/sylph-resources.ts`: `managedKvBindings` maps binding names to unique resource suffixes, and `managedQueueBindings` does the same for queues. Alchemy provisions the declared bindings and attaches each Queue consumer to the guarded application Worker. Add each binding's native type to `src/env.d.ts`.
+
+Use `managedKv(env, "SETTINGS", env.SETTINGS)` from `src/managed.ts` as the Layer for `ManagedKv`. Application D1 stores authoritative bytes, metadata, expiration, and versions. KV is a disposable cache. The managed API accepts values up to 1 MiB, UTF-8 keys up to 512 bytes, and serialized metadata up to 1024 bytes. Do not write application state directly to the native cache binding.
+
+Use `managedQueue(env, "JOBS", env.JOBS)` as the Layer for `CloudflareRecoveryQueue`. Enqueue with a stable message ID and JSON body. Add a handler under the same binding name in `src/managed-queue-handlers.ts`. Handlers must be idempotent using the message ID; delivery can repeat after failure or recovery. Keep effects inside the declared recoverable application state. The D1 journal supports 10000 rows and 64 KiB per message. Do not send raw application payloads through the native Queue binding.
+
+The Worker gates each consumer batch during recovery and acknowledges messages only after the handler and journal completion succeed. Before writer resume, release hooks replay pending journal IDs into the exact declared Queues. A failed replay leaves writers paused. `replayPending` is also available for explicit repair from a guarded application action.
+
+## Registered Durable Objects
+
+`managedDurableObjectBindings` maps each binding to an exported `className` and an explicit `objectNames` registry. The built-in `ManagedState` class in `src/managed-object.ts` stores JSON with gated `get`, `put`, and `delete` methods. Add the native namespace type to `src/env.d.ts`, use `idFromName` only with registered names, and keep the class exported from `src/worker.ts`.
+
+Recovery joins provider namespace IDs to the authenticated Worker registry and refuses unregistered stored objects. The read-only registry accepts the verification token. Capture and restore require a separate token derived from the recovery key with a domain-separated HMAC; the raw recovery key never enters the Worker. Both routes can address only reviewed IDs. Ordinary object work must use `withRecoveryObjectGate`; do not create untracked background writes. Every ordinary method must reject IDs outside its class registry before accessing storage. A subclass of `ManagedState` must override `recoveryClassName` with its declared export name. A custom class must delegate its recovery RPC to `recoverDurableObject` and reload its in-memory caches in the required `afterRestore` callback.
+
+The snapshot adapter covers SQLite tables, indexes, binary cells, and JSON KV storage. Its current bounds are 32 tables, 1000 rows per table, 1000 KV entries, and 4 MiB per object snapshot. Alarms, WebSockets, virtual tables, foreign keys, generated columns, and unsupported SQLite features stop capture. Register at most 100 objects across the application. New schema support requires its own verified restore drill.
+
+Initial managed-storage releases provision infrastructure, run the D1 and optional R2 drills, pause writers, and then publish the guarded Worker. Recovery captures provider-observed state while the application remains paused. The initial object drill must restore and independently verify the registered empty state before any object recovery receipt can report a verification timestamp.
+
+Set a declared binding to `false` in `scripts/managed-queue-consumers.json` to detach its consumer. The release requires its journal to be empty and keeps the Queue, binding, journal, and recovery topology. Managed producers reject new work while disabled. Normal releases permit detachment only; verified recovery to the selected immutable target can reattach the consumer. Detachment alone does not retire the Queue.

@@ -56,32 +56,65 @@ export const withRecoveryGate =
         status: 503,
         headers: { "Retry-After": "30" },
       })
-    const pending: Promise<void>[] = []
-    const tracked: ExecutionContext = {
-      waitUntil: (promise) => {
-        pending.push(
-          Promise.resolve(promise).then(
-            () => undefined,
-            () => undefined
-          )
+    return runRecoveryWork(environment, context, (tracked) =>
+      handler(request, environment, tracked)
+    )
+  }
+
+const runRecoveryWork = async <A>(
+  environment: RecoveryEnvironment,
+  context: ExecutionContext,
+  work: (tracked: ExecutionContext) => A | Promise<A>
+): Promise<A> => {
+  const pending: Promise<void>[] = []
+  const tracked: ExecutionContext = {
+    waitUntil: (promise) => {
+      pending.push(
+        Promise.resolve(promise).then(
+          () => undefined,
+          () => undefined
         )
-      },
-      passThroughOnException: () => {
-        throw new Error("Recovery-gated Workers cannot pass through exceptions")
-      },
-      props: context.props,
-      exports: context.exports,
-      tracing: context.tracing,
-      abort: (reason) => context.abort(reason),
-      cache: context.cache,
-      access: context.access,
+      )
+    },
+    passThroughOnException: () => {
+      throw new Error("Recovery-gated Workers cannot pass through exceptions")
+    },
+    props: context.props,
+    exports: context.exports,
+    tracing: context.tracing,
+    abort: (reason) => context.abort(reason),
+    cache: context.cache,
+    access: context.access,
+  }
+  try {
+    return await work(tracked)
+  } finally {
+    while (pending.length !== 0) await Promise.all(pending.splice(0))
+    await environment.SYLPH_RECOVERY_CONTROL.prepare(
+      "UPDATE sylph_recovery_gate SET active = active - 1 WHERE id = 1 AND active > 0"
+    ).run()
+  }
+}
+
+type RecoveryQueueHandler<Environment, Body> = (
+  batch: MessageBatch<Body>,
+  environment: Environment,
+  context: ExecutionContext
+) => void | Promise<void>
+
+export const withRecoveryQueueGate =
+  <Environment extends RecoveryEnvironment, Body>(
+    handler: RecoveryQueueHandler<Environment, Body>
+  ): RecoveryQueueHandler<Environment, Body> =>
+  async (batch, environment, context) => {
+    const admitted = await environment.SYLPH_RECOVERY_CONTROL.prepare(
+      "UPDATE sylph_recovery_gate SET active = active + 1 WHERE id = 1 AND owner IS NULL RETURNING active"
+    ).first<{ active: number }>()
+    if (!admitted) {
+      batch.retryAll({ delaySeconds: 30 })
+      return
     }
-    try {
-      return await handler(request, environment, tracked)
-    } finally {
-      while (pending.length !== 0) await Promise.all(pending.splice(0))
-      await environment.SYLPH_RECOVERY_CONTROL.prepare(
-        "UPDATE sylph_recovery_gate SET active = active - 1 WHERE id = 1 AND active > 0"
-      ).run()
-    }
+    return runRecoveryWork(environment, context, (tracked) =>
+      handler(batch, environment, tracked)
+    )
   }
